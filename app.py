@@ -1,3 +1,4 @@
+
 import streamlit as st
 import streamlit.components.v1 as components
 import datetime
@@ -29,21 +30,26 @@ def load_data():
             log['ts'] = datetime.datetime.fromisoformat(log['ts'])
         if data.get('phaseStart'):
             data['phaseStart'] = datetime.datetime.fromisoformat(data['phaseStart'])
+        if data.get('pause_start'):
+            data['pause_start'] = datetime.datetime.fromisoformat(data['pause_start'])
         return data
     except Exception:
         return None
 
 def save_data():
     s = {
-        'baby':       copy.deepcopy(st.session_state.baby),
-        'logs':       copy.deepcopy(st.session_state.logs),
-        'phase':      st.session_state.phase,
-        'phaseStart': st.session_state.phaseStart,
-        'utc_offset': st.session_state.get('utc_offset', 1),
-        'dw_start':   st.session_state.get('dw_start', 21),
-        'dw_end':     st.session_state.get('dw_end', 3),
-        'work_hour':  st.session_state.get('work_hour', 7),
-        'papa_mode':  st.session_state.get('papa_mode', '💼 Trabajando'),
+        'baby':            copy.deepcopy(st.session_state.baby),
+        'logs':            copy.deepcopy(st.session_state.logs),
+        'phase':           st.session_state.phase,
+        'phaseStart':      st.session_state.phaseStart,
+        'utc_offset':      st.session_state.get('utc_offset', 1),
+        'dw_start':        st.session_state.get('dw_start', 21),
+        'dw_end':          st.session_state.get('dw_end', 3),
+        'work_hour':       st.session_state.get('work_hour', 7),
+        'papa_mode':       st.session_state.get('papa_mode', '💼 Trabajando'),
+        'timer_paused':    st.session_state.get('timer_paused', False),
+        'paused_seconds':  st.session_state.get('paused_seconds', 0),
+        'pause_start':     st.session_state.get('pause_start'),
     }
     if s['baby'] and s['baby'].get('birth'):
         birth = s['baby']['birth']
@@ -54,6 +60,8 @@ def save_data():
             log['ts'] = log['ts'].isoformat()
     if s['phaseStart'] and hasattr(s['phaseStart'], 'isoformat'):
         s['phaseStart'] = s['phaseStart'].isoformat()
+    if s['pause_start'] and hasattr(s['pause_start'], 'isoformat'):
+        s['pause_start'] = s['pause_start'].isoformat()
     with open(DB_FILE, 'w') as f:
         json.dump(s, f)
 
@@ -61,27 +69,33 @@ def save_data():
 if 'initialized' not in st.session_state:
     db = load_data()
     if db:
-        st.session_state.baby        = db.get('baby')
-        st.session_state.logs        = db.get('logs', [])
-        st.session_state.phase       = db.get('phase', 'idle')
-        st.session_state.phaseStart  = db.get('phaseStart')
-        st.session_state.utc_offset  = db.get('utc_offset', 1)
-        st.session_state.dw_start    = db.get('dw_start', 21)
-        st.session_state.dw_end      = db.get('dw_end', 3)
-        st.session_state.work_hour   = db.get('work_hour', 7)
-        st.session_state.papa_mode   = db.get('papa_mode', '💼 Trabajando')
-        st.session_state.page        = "main"
+        st.session_state.baby            = db.get('baby')
+        st.session_state.logs            = db.get('logs', [])
+        st.session_state.phase           = db.get('phase', 'idle')
+        st.session_state.phaseStart      = db.get('phaseStart')
+        st.session_state.utc_offset      = db.get('utc_offset', 1)
+        st.session_state.dw_start        = db.get('dw_start', 21)
+        st.session_state.dw_end          = db.get('dw_end', 3)
+        st.session_state.work_hour       = db.get('work_hour', 7)
+        st.session_state.papa_mode       = db.get('papa_mode', '💼 Trabajando')
+        st.session_state.timer_paused    = db.get('timer_paused', False)
+        st.session_state.paused_seconds  = db.get('paused_seconds', 0)
+        st.session_state.pause_start     = db.get('pause_start')
+        st.session_state.page            = "main"
     else:
-        st.session_state.baby        = None
-        st.session_state.logs        = []
-        st.session_state.phase       = "idle"
-        st.session_state.phaseStart  = None
-        st.session_state.utc_offset  = 1
-        st.session_state.dw_start    = 21
-        st.session_state.dw_end      = 3
-        st.session_state.work_hour   = 7
-        st.session_state.papa_mode   = '💼 Trabajando'
-        st.session_state.page        = "setup"
+        st.session_state.baby            = None
+        st.session_state.logs            = []
+        st.session_state.phase           = "idle"
+        st.session_state.phaseStart      = None
+        st.session_state.utc_offset      = 1
+        st.session_state.dw_start        = 21
+        st.session_state.dw_end          = 3
+        st.session_state.work_hour       = 7
+        st.session_state.papa_mode       = '💼 Trabajando'
+        st.session_state.timer_paused    = False
+        st.session_state.paused_seconds  = 0
+        st.session_state.pause_start     = None
+        st.session_state.page            = "setup"
     st.session_state.initialized = True
 
 # ─── HELPERS ──────────────────────────────────────────────────
@@ -134,22 +148,35 @@ def get_feed_range(days):
 def get_aw_max(days):
     return get_aw_range(days)[1]
 
-def elapsed_min():
+def elapsed_sec():
+    """Segundos transcurridos en la fase actual, descontando tiempo pausado."""
     if not st.session_state.phaseStart:
         return 0
-    return int((now_local() - st.session_state.phaseStart).total_seconds() / 60)
+    total = (now_local() - st.session_state.phaseStart).total_seconds()
+    paused = st.session_state.get('paused_seconds', 0)
+    if st.session_state.get('timer_paused') and st.session_state.get('pause_start'):
+        paused += (now_local() - st.session_state.pause_start).total_seconds()
+    return max(0, int(total - paused))
 
-def add_log(log_type, dur_min=0, color=None):
-    log = {"type": log_type, "ts": now_local(), "durMin": dur_min, "color": color}
+def elapsed_min():
+    return elapsed_sec() // 60
+
+def add_log(log_type, dur_min=0, color=None, ts=None):
+    """Añade un log. Si ts=None usa now_local() (tiempo real). Si ts se provee, es un log retroactivo."""
+    log = {"type": log_type, "ts": ts if ts is not None else now_local(), "durMin": dur_min, "color": color}
     st.session_state.logs.append(log)
+    st.session_state.logs.sort(key=lambda x: x['ts'])  # mantener orden cronológico
     save_data()
 
 def change_phase(new_phase):
     dur = elapsed_min()
     if st.session_state.phaseStart and st.session_state.phase != "idle" and dur > 1:
         add_log(st.session_state.phase, dur)
-    st.session_state.phase      = new_phase
-    st.session_state.phaseStart = now_local()
+    st.session_state.phase          = new_phase
+    st.session_state.phaseStart     = now_local()
+    st.session_state.timer_paused   = False
+    st.session_state.paused_seconds = 0
+    st.session_state.pause_start    = None
     save_data()
 
 # ─── LACTANCIA POR EDAD → ROL DE PAPÁ ─────────────────────────
@@ -181,8 +208,25 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
     feed_type = baby.get('feed', 'Mixta')
     is_fase1  = days < 120
 
+    # ── Anclar en el último evento registrado si es más reciente que phaseStart ──
+    # Esto permite que los eventos retroactivos actualicen el pronóstico
+    recent_logs = [l for l in st.session_state.logs
+                   if l['ts'] <= now and l['type'] in ("feeding", "sleeping", "activity")]
+    if recent_logs:
+        last_log = max(recent_logs, key=lambda x: x['ts'])
+        last_end = last_log['ts'] + datetime.timedelta(minutes=last_log.get('durMin', 0))
+        # Si el final del último log es más reciente que phaseStart, re-anclar
+        phase_start = st.session_state.phaseStart or (now - datetime.timedelta(minutes=sim_elapsed))
+        if last_end > phase_start and last_end <= now:
+            current_phase = {
+                "feeding":  "sleeping" if (now.hour >= 20 or now.hour < 7) else "activity",
+                "sleeping": "feeding",
+                "activity": "sleeping",
+            }.get(last_log['type'], current_phase)
+            sim_elapsed = int((now - last_end).total_seconds() / 60)
+
     cursor    = now
-    limit     = now + timedelta(hours=24)
+    limit     = now + datetime.timedelta(hours=24)
     agenda    = []
     MAX_ITER  = 80
 
@@ -480,46 +524,73 @@ def render_main():
     st.markdown("---")
     phase = st.session_state.phase
 
-    # --- CRONÓMETRO EN VIVO ---
+    # --- CRONÓMETRO EN VIVO CON PAUSA ---
     if phase != "idle" and st.session_state.phaseStart:
-        # Calculamos los segundos exactos que han pasado desde el inicio de la fase
-        diff_sec = int((now - st.session_state.phaseStart).total_seconds())
-        
-        # Asignamos colores e iconos según el estado
+        diff_sec  = elapsed_sec()
+        is_paused = st.session_state.get('timer_paused', False)
+
         if phase == "sleeping":
-            t_color = "#8B5CF6"  # Morado
+            t_color = "#8B5CF6"
             t_icon, t_label = "😴", "Durmiendo"
         elif phase == "feeding":
-            t_color = "#22C55E"  # Verde
+            t_color = "#22C55E"
             t_icon, t_label = "🍼", "Comiendo"
         else:
-            t_color = "#F97316"  # Naranja
+            t_color = "#F97316"
             t_icon, t_label = "🎯", "Actividad"
 
+        pause_bg = "#FEF3C7" if is_paused else "#f9fafb"
+        pause_border = "#F59E0B" if is_paused else "#e5e7eb"
+        paused_notice = "<div style='font-size:0.85rem;color:#B45309;font-weight:bold;margin-top:4px;'>⏸ PAUSADO</div>" if is_paused else ""
+
         html_timer = f"""
-        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 10px; background: #f9fafb; border-radius: 12px; border: 1px solid #e5e7eb; margin-bottom: 15px;">
-            <div style="font-size: 1.1rem; color: #4B5563; font-weight: bold; font-family: system-ui, sans-serif;">{t_icon} {t_label}</div>
-            <div id="live-timer" style="font-size: 4rem; font-weight: 900; color: {t_color}; font-variant-numeric: tabular-nums; line-height: 1.1; font-family: system-ui, sans-serif;">
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+                    padding:10px;background:{pause_bg};border-radius:12px;
+                    border:1px solid {pause_border};margin-bottom:15px;">
+            <div style="font-size:1.1rem;color:#4B5563;font-weight:bold;font-family:system-ui,sans-serif;">
+                {t_icon} {t_label}
+            </div>
+            <div id="live-timer" style="font-size:4rem;font-weight:900;color:{t_color};
+                 font-variant-numeric:tabular-nums;line-height:1.1;font-family:system-ui,sans-serif;">
                 00:00
             </div>
+            {paused_notice}
         </div>
         <script>
-            var diff = {diff_sec};
-            var timerEl = document.getElementById("live-timer");
-            function updateTime() {{
-                var h = Math.floor(diff / 3600);
-                var m = Math.floor((diff % 3600) / 60);
-                var s = diff % 60;
-                var timeStr = (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s);
-                if (h > 0) timeStr = h + ":" + timeStr;
-                timerEl.innerHTML = timeStr;
-                diff++;
+            var diff    = {diff_sec};
+            var running = {"false" if is_paused else "true"};
+            var el      = document.getElementById("live-timer");
+            function fmt() {{
+                var h = Math.floor(diff/3600);
+                var m = Math.floor((diff%3600)/60);
+                var s = diff%60;
+                var t = (m<10?"0"+m:m)+":"+(s<10?"0"+s:s);
+                if (h>0) t = h+":"+t;
+                el.innerHTML = t;
             }}
-            updateTime();
-            setInterval(updateTime, 1000);
+            fmt();
+            setInterval(function(){{if(running){{diff++;fmt();}}}}, 1000);
         </script>
         """
-        components.html(html_timer, height=135)
+        components.html(html_timer, height=145)
+
+        # Botón de pausa / reanudar
+        pause_label = "▶️ Reanudar" if is_paused else "⏸ Pausar"
+        if st.button(pause_label, key="btn_pause", use_container_width=False):
+            if is_paused:
+                # Reanudar: acumular los segundos pausados y limpiar pause_start
+                if st.session_state.pause_start:
+                    st.session_state.paused_seconds += int(
+                        (now_local() - st.session_state.pause_start).total_seconds()
+                    )
+                st.session_state.pause_start  = None
+                st.session_state.timer_paused = False
+            else:
+                # Pausar
+                st.session_state.pause_start  = now_local()
+                st.session_state.timer_paused = True
+            save_data()
+            st.rerun()
     
     # --- MENSAJES DINÁMICOS DE ESTADO ---
     if phase == "idle":
@@ -547,11 +618,12 @@ def render_main():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     if c1.button("🍼 Comer",  use_container_width=True): change_phase("feeding");  st.rerun()
     if c2.button("😴 Dormir", use_container_width=True): change_phase("sleeping"); st.rerun()
     if c3.button("🎯 Jugar",  use_container_width=True): change_phase("activity"); st.rerun()
     if c4.button("🧷 Pañal",  use_container_width=True): st.session_state.page = "diaper"; st.rerun()
+    if c5.button("📝 Olvidé", use_container_width=True): st.session_state.page = "log_past"; st.rerun()
 
     st.markdown("---")
     hoy = now.date()
@@ -619,6 +691,98 @@ def render_diaper():
             st.session_state.page = "main"; st.rerun()
     if c2.button("Cancelar"):
         st.session_state.page = "main"; st.rerun()
+
+def render_log_past():
+    """Permite registrar un evento pasado que se olvidó anotar en tiempo real."""
+    st.subheader("📝 Registrar evento olvidado")
+    st.caption("Añade una toma, siesta o actividad que ocurrió antes y no registraste.")
+
+    if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
+
+    now   = now_local()
+    today = now.date()
+
+    tipo_display = st.selectbox(
+        "¿Qué ocurrió?",
+        ["🍼 Toma (alimentación)", "😴 Siesta / sueño", "🎯 Actividad / juego",
+         "💧 Pañal pipí", "💩 Pañal caca", "💧💩 Pañal pipí + caca"]
+    )
+    tipo_map = {
+        "🍼 Toma (alimentación)": "feeding",
+        "😴 Siesta / sueño":      "sleeping",
+        "🎯 Actividad / juego":   "activity",
+        "💧 Pañal pipí":          "diaper_wet",
+        "💩 Pañal caca":          "diaper_dirty",
+        "💧💩 Pañal pipí + caca": "diaper_both",
+    }
+    tipo = tipo_map[tipo_display]
+
+    st.markdown("**¿Cuándo empezó?**")
+    col_h, col_m = st.columns(2)
+    hora_h = col_h.number_input("Hora", min_value=0, max_value=23, value=now.hour, step=1)
+    hora_m = col_m.number_input("Minuto", min_value=0, max_value=59, value=max(0, now.minute - 5), step=5)
+
+    # Determinar si es hoy o ayer (si la hora futura → asumir ayer)
+    ts_candidate = datetime.datetime.combine(today, datetime.time(int(hora_h), int(hora_m)))
+    ts_candidate = ts_candidate.replace(tzinfo=None)  # sin tz, igual que now_local()
+    if ts_candidate > now:
+        ts_candidate -= datetime.timedelta(days=1)
+
+    dur_min = 0
+    if tipo in ("feeding", "sleeping", "activity"):
+        dur_min = st.number_input(
+            "Duración (minutos)",
+            min_value=1, max_value=480,
+            value=20 if tipo == "feeding" else (90 if tipo == "sleeping" else 30),
+            step=5
+        )
+
+    color = None
+    if tipo == "diaper_dirty":
+        color = st.selectbox("Color de la caca:", [
+            "Mostaza 🟡 (Normal)", "Verde 💚 (Normal/Transición)",
+            "Meconio ⬛ (Normal primeros días)",
+            "Blanca/Gris ⬜ (⚠️ Alerta pediátrica)",
+            "Roja/Sangre 🔴 (⚠️ Alerta pediátrica)",
+        ])
+
+    # Opción de actualizar la fase actual
+    ts_fin = ts_candidate + datetime.timedelta(minutes=int(dur_min))
+    actualizar_fase = False
+    if tipo in ("feeding", "sleeping", "activity") and ts_fin <= now:
+        fase_sugerida = {
+            "feeding": "sleeping" if (now_local().hour >= 20 or now_local().hour < 7) else "activity",
+            "sleeping": "feeding",
+            "activity": "sleeping",
+        }.get(tipo, "idle")
+        actualizar_fase = st.checkbox(
+            f"Actualizar fase actual → el bebé empezó a "
+            f"{'🍼 comer' if fase_sugerida=='feeding' else '😴 dormir' if fase_sugerida=='sleeping' else '🎯 jugar'}"
+            f" a las {ts_fin.strftime('%H:%M')} (justo después de este evento)",
+            value=True
+        )
+
+    st.caption(f"📅 Se registrará como: **{ts_candidate.strftime('%H:%M')}** del "
+               f"{'hoy' if ts_candidate.date() == today else 'ayer'}"
+               + (f" · duración: **{dur_min} min** · fin: **{ts_fin.strftime('%H:%M')}**"
+                  if dur_min else ""))
+
+    col_ok, col_cancel = st.columns(2)
+    if col_ok.button("✅ Guardar evento", type="primary"):
+        add_log(tipo, dur_min=int(dur_min), color=color, ts=ts_candidate)
+        if actualizar_fase and tipo in ("feeding", "sleeping", "activity"):
+            st.session_state.phase          = fase_sugerida
+            st.session_state.phaseStart     = ts_fin
+            st.session_state.timer_paused   = False
+            st.session_state.paused_seconds = 0
+            st.session_state.pause_start    = None
+            save_data()
+        st.success("✅ Evento guardado. El pronóstico se actualizará.")
+        st.session_state.page = "main"
+        st.rerun()
+    if col_cancel.button("Cancelar"):
+        st.session_state.page = "main"; st.rerun()
+
 
 def render_metrics():
     st.subheader("📊 Métricas del día")
@@ -919,4 +1083,5 @@ def render_guide():
     "history":  render_history,
     "metrics":  render_metrics,
     "guide":    render_guide,
+    "log_past": render_log_past,
 }.get(st.session_state.page, render_setup)()
