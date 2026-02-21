@@ -10,7 +10,6 @@ st.set_page_config(page_title="BebéGuía", page_icon="🌙", layout="centered")
 DB_FILE = 'bebe_db.json'
 
 # ─── TIMEZONE ─────────────────────────────────────────────────
-# Streamlit Cloud corre en UTC. Guardamos offset en config.
 def now_local():
     offset = st.session_state.get('utc_offset', 1)
     return datetime.datetime.utcnow() + timedelta(hours=offset)
@@ -95,24 +94,16 @@ def age_weeks():
     return age_days() // 7
 
 def get_aw_range(days):
-    """
-    Rango de vigilia normal (min, max) en minutos según edad.
-    Fuente: ciclos ultradianos RN, ventana aumenta con madurez.
-    """
     w = days // 7
-    if w < 2:  return 45,  75    # 0-2 sem
-    if w < 4:  return 50,  80    # 2-4 sem
-    if w < 8:  return 60,  90    # 4-8 sem
-    if w < 12: return 75, 105    # 8-12 sem
-    if w < 16: return 90, 120    # 12-16 sem
-    if w < 24: return 105, 150   # 16-24 sem
+    if w < 2:  return 45,  75
+    if w < 4:  return 50,  80
+    if w < 8:  return 60,  90
+    if w < 12: return 75, 105
+    if w < 16: return 90, 120
+    if w < 24: return 105, 150
     return 120, 180
 
 def get_sleep_range(days, is_night):
-    """
-    Rango de duración de sueño (min, max, label) según edad y momento.
-    Noche = bloque entre tomas. Día = siesta diurna.
-    """
     w = days // 7
     if is_night:
         if w < 2:  return  90, 150, "1.5–2.5h"
@@ -129,31 +120,28 @@ def get_sleep_range(days, is_night):
         if w < 16: return  60,  90, "1–1.5h"
         return           60, 120, "1–2h"
 
+def get_sleep_durations(days, is_night):
+    """Devuelve (duración_media_min, label) para la simulación de agenda."""
+    lo, hi, lbl = get_sleep_range(days, is_night)
+    avg = (lo + hi) // 2
+    return avg, lbl
+
 def get_feed_range(days):
-    """Rango normal de duración de toma (min, max)."""
     if "materna" in (st.session_state.baby or {}).get('feed', '').lower():
         return 10, 30
     return 10, 25
 
-# Compatibilidad con referencias antiguas
 def get_aw_max(days):
     return get_aw_range(days)[1]
 
 def phase_status(phase, elapsed, days):
-    """
-    Devuelve (estado, color_hex, mensaje) según si el tiempo en la fase
-    es normal, límite o excedido respecto al rango esperado.
-    estados: 'ok', 'warning', 'alert'
-    """
     if phase == "activity":
         lo, hi = get_aw_range(days)
         if elapsed < lo:
             return 'ok', '#22C55E', f"✅ Normal — aún dentro del rango ({lo}–{hi} min despierto)"
         if elapsed <= hi:
-            pct = int((elapsed - lo) / (hi - lo) * 100)
             return 'warning', '#F59E0B', f"⚠️ Acercándose al límite — {hi - elapsed} min restantes (rango: {lo}–{hi} min)"
         return 'alert', '#EF4444', f"🚨 Ventana cerrada — lleva {elapsed} min (máx. {hi} min)"
-
     elif phase == "feeding":
         lo, hi = get_feed_range(days)
         if elapsed < lo:
@@ -161,7 +149,6 @@ def phase_status(phase, elapsed, days):
         if elapsed <= hi:
             return 'ok', '#22C55E', f"✅ Duración normal ({lo}–{hi} min)"
         return 'warning', '#F59E0B', f"⚠️ Toma larga ({elapsed} min) — si está relajado y suelto, ya está satisfecho"
-
     elif phase == "sleeping":
         h = now_local().hour
         is_night = h >= 20 or h < 7
@@ -172,7 +159,6 @@ def phase_status(phase, elapsed, days):
         if elapsed <= hi:
             return 'ok', '#8B5CF6', f"😴 Dentro del rango ({lo}–{hi} min) — despertará pronto"
         return 'warning', '#F59E0B', f"⚠️ Sueño largo ({elapsed} min) — máx. esperado {hi} min. Puede estar bien."
-
     return 'ok', '#6B7280', ""
 
 def elapsed_min():
@@ -195,7 +181,6 @@ def change_phase(new_phase):
 
 # ─── LACTANCIA POR EDAD → ROL DE PAPÁ ─────────────────────────
 def papa_feed_method(days, feed_type):
-    """Qué puede hacer papá en la toma según edad y método."""
     weeks = days // 7
     if "materna" in feed_type.lower():
         if weeks < 2:
@@ -216,20 +201,8 @@ def papa_feed_method(days, feed_type):
     else:
         return "🍼 Prepara y da biberón completo"
 
-# ─── AGENDA EASY COMPLETA ─────────────────────────────────────
-# Cada ciclo EASY genera 4 eventos: Eat · Activity · Sleep · You
-# Se reajusta partiendo del estado real actual del bebé.
-
+# ─── CONFIGURACIÓN MODO PAPÁ ──────────────────────────────────
 def get_papa_mode_config():
-    """
-    Devuelve configuración de turnos según el modo de papá.
-    Cada modo define:
-      - day_duty: papá cubre también siestas diurnas (no solo nocturnas)
-      - day_shift_start/end: franja de día en que papá asume el bebé
-      - work_label: etiqueta para el planificador
-      - mama_day_role: qué puede hacer mamá cuando papá cubre de día
-      - papa_day_role: qué hace papá de día
-    """
     mode = st.session_state.get('papa_mode', '💼 Trabajando')
     dw_s = st.session_state.get('dw_start', 21)
     dw_e = st.session_state.get('dw_end', 3)
@@ -237,41 +210,36 @@ def get_papa_mode_config():
 
     if '💼 Trabajando' in mode:
         return dict(
-            mode_label   = "💼 Trabajando",
-            day_duty     = False,          # papá no cubre de día
-            dw_start     = dw_s,
-            dw_end       = dw_e,
-            work_hour    = wh,
-            mama_day     = "🤱 Gestiona sola — ¡eres increíble!",
-            papa_day     = "💼 En el trabajo",
-            mama_note    = None,
+            mode_label="💼 Trabajando", day_duty=False,
+            dw_start=dw_s, dw_end=dw_e, work_hour=wh,
+            mama_day="🤱 Gestiona sola — ¡eres increíble!",
+            papa_day="💼 En el trabajo", mama_note=None,
         )
     elif '🏠 Teletrabajo' in mode:
         return dict(
-            mode_label   = "🏠 Teletrabajo",
-            day_duty     = True,
-            day_shift_s  = 12,             # papá cubre siesta de mediodía
-            day_shift_e  = 14,
-            dw_start     = dw_s,
-            dw_end       = dw_e,
-            work_hour    = wh,
-            mama_day     = "😴 Duerme / descansa (siesta de mediodía)",
-            papa_day     = "🏠 Cuida al bebé entre reuniones (12–14h)",
-            mama_note    = "📅 Papá cubre la siesta de mediodía (12–14h) → aprovecha para dormir.",
+            mode_label="🏠 Teletrabajo", day_duty=True,
+            day_shift_s=12, day_shift_e=14,
+            dw_start=dw_s, dw_end=dw_e, work_hour=wh,
+            mama_day="😴 Duerme / descansa (siesta de mediodía)",
+            papa_day="🏠 Cuida al bebé entre reuniones (12–14h)",
+            mama_note="📅 Papá cubre la siesta de mediodía (12–14h) → aprovecha para dormir.",
         )
     else:  # Vacaciones
         return dict(
-            mode_label   = "🌴 Vacaciones",
-            day_duty     = True,
-            day_shift_s  = 8,              # papá cubre toda la mañana
-            day_shift_e  = 14,
-            dw_start     = dw_s,
-            dw_end       = dw_e,
-            work_hour    = 23,             # no tiene que madrugar → duerme más
-            mama_day     = "😴 Duerme / ducha / come / respira",
-            papa_day     = "🌴 Turno completo mañana (08–14h) — mamá descansa",
-            mama_note    = "🌴 Papá lleva el turno de mañana (8–14h). Mamá: duerme sin culpa.",
+            mode_label="🌴 Vacaciones", day_duty=True,
+            day_shift_s=8, day_shift_e=14,
+            dw_start=dw_s, dw_end=dw_e, work_hour=23,
+            mama_day="😴 Duerme / ducha / come / respira",
+            papa_day="🌴 Turno completo mañana (08–14h) — mamá descansa",
+            mama_note="🌴 Papá lleva el turno de mañana (8–14h). Mamá: duerme sin culpa.",
         )
+
+# ─── AGENDA EASY COMPLETA ─────────────────────────────────────
+def build_agenda(baby, now, current_phase, sim_elapsed):
+    """
+    Genera la agenda EASY de 24h partiendo del estado actual del bebé.
+    Cada ciclo: Eat · Activity · Sleep · You-time.
+    """
     days      = age_days()
     aw_max    = get_aw_max(days)
     feed_type = baby.get('feed', 'Mixta')
@@ -286,14 +254,15 @@ def get_papa_mode_config():
     mama_sleep_min = 0
     mama_free_min  = 0
 
-    # Para calcular el bloque continuo de papá:
-    # Guardamos (inicio_turno_papa, fin_turno_papa) de cada tramo nocturno
     papa_was_on_duty = False
     papa_shift_start = None
-    papa_shifts      = []   # lista de (start, end) de cada turno de papá
+    papa_shifts      = []
+
+    dw_s = st.session_state.get('dw_start', 21)
+    dw_e = st.session_state.get('dw_end', 3)
 
     def is_papas_shift(h):
-        return h >= 21 or h < 3
+        return h >= dw_s or h < dw_e
 
     for _ in range(MAX_ITER):
         if cursor >= limit or len(agenda) >= 30:
@@ -328,7 +297,6 @@ def get_papa_mode_config():
                 papa_ev = f"🎯 {act_desc} · Señales: bostezos, mirada perdida"
                 bg, brd = "#FFF7ED", "#F97316"
 
-            # Tracking turno papá
             if on_duty and not papa_was_on_duty:
                 papa_shift_start = cursor - timedelta(minutes=act_dur)
                 papa_was_on_duty = True
@@ -386,9 +354,9 @@ def get_papa_mode_config():
             sleep_dur, sleep_lbl = get_sleep_durations(days, is_night)
 
             wait          = max(1, sleep_dur - sim_elapsed)
-            sleep_start   = cursor                        # momento en que bebé se duerme
+            sleep_start   = cursor
             cursor       += timedelta(minutes=wait)
-            wake_time_str = cursor.strftime("%H:%M")      # hora proyectada de despertar
+            wake_time_str = cursor.strftime("%H:%M")
             h             = cursor.hour
             on_duty       = is_papas_shift(h) or is_papas_shift(sleep_start.hour)
 
@@ -399,7 +367,6 @@ def get_papa_mode_config():
             if on_duty:
                 mama_sleep_min += sleep_dur
                 mama_role = "💤 DURMIENDO — bloque largo"
-                # Alarma mostrada en el momento en que papá SE VA A DORMIR (sleep_start)
                 papa_role = (f"😴 DUERME AHORA — ⏰ pon alarma a las {wake_time_str} "
                              f"| Al sonar: {papa_hint}")
                 bg, brd   = "#EDE9FE", "#8B5CF6"
@@ -416,7 +383,6 @@ def get_papa_mode_config():
                 papa_shifts.append((papa_shift_start, sleep_start))
                 papa_was_on_duty = False
 
-            # Evento = momento en que bebé SE DUERME (con alarma incluida para papá)
             agenda.append(dict(
                 hora=sleep_start.strftime("%H:%M"), icono="🌙",
                 evento=f"Bebé se duerme — despertará ~{wake_time_str} ({sleep_lbl})",
@@ -429,12 +395,9 @@ def get_papa_mode_config():
     if papa_was_on_duty and papa_shift_start:
         papa_shifts.append((papa_shift_start, cursor))
 
-    # Bloque continuo de papá = fin del último turno nocturno → próximo despertar
-    # (él puede dormir desde que termina su guardia hasta que el bebé vuelve a llamar)
     papa_block_min = 0
     if papa_shifts:
-        last_end = papa_shifts[-1][1]   # hora en que terminó su último turno
-        # Próximo evento de la agenda después de last_end
+        last_end = papa_shifts[-1][1]
         next_wake = next(
             (datetime.datetime.strptime(
                 last_end.strftime("%Y-%m-%d") + " " + item["hora"], "%Y-%m-%d %H:%M")
@@ -442,11 +405,10 @@ def get_papa_mode_config():
              if datetime.datetime.strptime(
                  last_end.strftime("%Y-%m-%d") + " " + item["hora"], "%Y-%m-%d %H:%M"
              ) > last_end),
-            last_end + timedelta(hours=3)   # fallback: 3h si no hay evento
+            last_end + timedelta(hours=3)
         )
         papa_block_min = int((next_wake - last_end).total_seconds() / 60)
 
-    # Tiempo total de guardia de papá
     papa_duty_min = sum(
         int((e - s).total_seconds() / 60) for s, e in papa_shifts
     )
@@ -460,12 +422,12 @@ def get_papa_mode_config():
     )
     return agenda, summary
 
+
 def render_agenda(agenda, summary):
     if not agenda:
         st.info("Sin previsión disponible.")
         return
 
-    # ── Resumen destacado ─────────────────────────────────────
     st.markdown("#### 📊 Resumen proyectado (24h)")
     c1, c2, c3 = st.columns(3)
     c1.metric("🍼 Tomas mínimas", summary["tomas"],
@@ -483,7 +445,6 @@ def render_agenda(agenda, summary):
 
     st.markdown("---")
 
-    # ── Separador día / noche ─────────────────────────────────
     prev_is_night = None
     for item in agenda:
         h          = int(item["hora"].split(":")[0])
@@ -608,10 +569,8 @@ def render_main():
     now    = now_local()
     el     = elapsed_min()
 
-    # Cabecera
     c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 1, 1])
     with c1:
-        # Mostrar días o días antes del parto si es futuro
         days_to_birth = (baby.get('birth', datetime.date.today()) - datetime.date.today()).days
         if isinstance(baby.get('birth'), str):
             birth_d = datetime.datetime.strptime(baby['birth'], "%Y-%m-%d").date()
@@ -638,11 +597,9 @@ def render_main():
 
     if phase == "idle":
         st.info("☀️ **Despierto y tranquilo** — Ofrécele pecho/biberón cuando busque.")
-
     elif phase == "feeding":
         st.success(f"🍼 **Comiendo** — {el} min\n\n"
                    f"{'Si se duerme comiendo: normal antes de los 4 meses. Ponlo a dormir directamente.' if days < 120 else 'Intenta que termine despierto para separar toma y sueño.'}")
-
     elif phase == "sleeping":
         st.markdown(
             f"<div style='background:#F3E8FF;padding:15px;border-radius:10px;margin-bottom:12px;'>"
@@ -653,7 +610,6 @@ def render_main():
             st.error("🚨 Casi 4h sin comer. Despiértalo suavemente.")
         elif days >= 30 and 7 <= now.hour < 20 and el >= 120:
             st.warning("⚠️ Siesta >2h de día. Plantéate despertarle para proteger el sueño nocturno.")
-
     elif phase == "activity":
         pct   = min(int(el / aw_max * 100), 100)
         color = "green" if pct < 60 else ("orange" if pct < 85 else "red")
@@ -669,14 +625,12 @@ def render_main():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Botones
     c1, c2, c3, c4 = st.columns(4)
     if c1.button("🍼 Comer",  use_container_width=True): change_phase("feeding");  st.rerun()
     if c2.button("😴 Dormir", use_container_width=True): change_phase("sleeping"); st.rerun()
     if c3.button("🎯 Jugar",  use_container_width=True): change_phase("activity"); st.rerun()
     if c4.button("🧷 Pañal",  use_container_width=True): st.session_state.page = "diaper"; st.rerun()
 
-    # Métricas
     st.markdown("---")
     hoy = now.date()
     logs_hoy = [l for l in st.session_state.logs if l['ts'].date() == hoy]
@@ -687,7 +641,6 @@ def render_main():
     col2.metric("Pañales mojados", wet, help="Mínimo: 6/día")
     col3.metric("Tiempo en fase", f"{el} min")
 
-    # Agenda EASY
     st.markdown("---")
     st.subheader("📅 Planificador EASY — Próximas 24h")
     st.caption("Se ajusta al ritmo real del bebé. Morado = turno de papá (Dream Window).")
@@ -698,7 +651,6 @@ def render_history():
     st.subheader("📋 Historial de hoy")
     if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
     hoy = now_local().date()
-    # Guardamos (índice_global, log) para poder borrar por índice real
     logs_hoy_idx = [(i, l) for i, l in enumerate(st.session_state.logs)
                     if l['ts'].date() == hoy]
     if not logs_hoy_idx:
@@ -746,7 +698,6 @@ def render_diaper():
     if c2.button("Cancelar"):
         st.session_state.page = "main"; st.rerun()
 
-# ─── MÉTRICAS ─────────────────────────────────────────────────
 def render_metrics():
     st.subheader("📊 Métricas del día")
     if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
@@ -765,7 +716,6 @@ def render_metrics():
     wet_logs   = [l for l in logs_hoy if l['type'] in ('diaper_wet', 'diaper_both')]
     dirty_logs = [l for l in logs_hoy if l['type'] in ('diaper_dirty', 'diaper_both')]
 
-    # Sueño total (incluye fase actual si está durmiendo)
     total_sleep_min = sum(l.get('durMin', 0) for l in sleep_logs)
     current_el = elapsed_min()
     if st.session_state.phase == 'sleeping':
@@ -774,13 +724,10 @@ def render_metrics():
     if st.session_state.phase == 'sleeping':
         longest_sleep = max(longest_sleep, current_el)
 
-    # Minutos de día transcurridos desde medianoche
     mins_since_midnight = int((now - datetime.datetime.combine(hoy, datetime.time.min)).total_seconds() / 60)
     pct_sleep = round(total_sleep_min / mins_since_midnight * 100) if mins_since_midnight > 0 else 0
-    # Referencia: RN duerme 16-18h/día → 67-75%
     sleep_ok = pct_sleep >= 55
 
-    # Alimentación
     total_feed_min = sum(l.get('durMin', 0) for l in feed_logs)
     avg_feed = round(total_feed_min / len(feed_logs)) if feed_logs else 0
     feed_times = sorted([l['ts'] for l in feed_logs])
@@ -849,7 +796,6 @@ def render_metrics():
     else:
         st.caption("Sin eventos registrados aún.")
 
-# ─── GUÍA DE DESARROLLO ───────────────────────────────────────
 def render_guide():
     st.subheader("📖 Guía de desarrollo")
     if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
@@ -858,54 +804,41 @@ def render_guide():
     weeks = days // 7
     feed  = (st.session_state.baby or {}).get('feed', 'Lactancia materna exclusiva')
 
-    # ── Selector de semana (permite explorar semanas futuras) ──
     max_w = max(weeks, 0)
     sel_w = st.slider("Ver guía para la semana:", 0, 24, max_w,
                       help="Mueve para explorar cómo evolucionará el bebé")
     sel_days = sel_w * 7
 
-    # ── Etiqueta de etapa ─────────────────────────────────────
     if sel_w < 4:
-        etapa = "🌱 Recién nacido (0–4 semanas)"
-        color = "#FEF9C3"
+        etapa = "🌱 Recién nacido (0–4 semanas)"; color = "#FEF9C3"
     elif sel_w < 8:
-        etapa = "🌿 Primer mes (4–8 semanas)"
-        color = "#DCFCE7"
+        etapa = "🌿 Primer mes (4–8 semanas)"; color = "#DCFCE7"
     elif sel_w < 12:
-        etapa = "🌸 Segundo mes (8–12 semanas)"
-        color = "#E0F2FE"
+        etapa = "🌸 Segundo mes (8–12 semanas)"; color = "#E0F2FE"
     elif sel_w < 24:
-        etapa = "🌻 3–6 meses (12–24 semanas)"
-        color = "#EDE9FE"
+        etapa = "🌻 3–6 meses (12–24 semanas)"; color = "#EDE9FE"
     else:
-        etapa = "🌳 +6 meses"
-        color = "#FEE2E2"
+        etapa = "🌳 +6 meses"; color = "#FEE2E2"
 
     st.markdown(f"<div style='background:{color};padding:10px 14px;"
                 f"border-radius:8px;font-weight:bold;margin-bottom:16px;'>"
                 f"{etapa} — Semana {sel_w}</div>", unsafe_allow_html=True)
 
-    # ── SUEÑO ─────────────────────────────────────────────────
     st.markdown("### 😴 Sueño")
     aw_lo, aw_hi = get_aw_range(sel_days)
     lo_n, hi_n, lbl_n = get_sleep_range(sel_days, is_night=True)
     lo_d, hi_d, lbl_d = get_sleep_range(sel_days, is_night=False)
 
     if sel_w < 4:
-        total_h = "16–20h"; siestas = "Sin patrón fijo — ciclos de 45–75 min despierto"
-        notas_sueno = "No hay ritmo circadiano. Día = Noche para él. Normal despertar cada 2–3h."
+        total_h = "16–20h"; notas_sueno = "No hay ritmo circadiano. Día = Noche para él. Normal despertar cada 2–3h."
     elif sel_w < 8:
-        total_h = "15–17h"; siestas = "3–4 siestas/día de duración muy variable"
-        notas_sueno = "Empieza a agrupar ligeramente por las noches. Aún normal despertar 2–3× noche."
+        total_h = "15–17h"; notas_sueno = "Empieza a agrupar ligeramente por las noches. Aún normal despertar 2–3× noche."
     elif sel_w < 12:
-        total_h = "~15h"; siestas = "3–4 siestas de 45–90 min"
-        notas_sueno = "Inicia producción de melatonina. Empieza a distinguir día/noche."
+        total_h = "~15h"; notas_sueno = "Inicia producción de melatonina. Empieza a distinguir día/noche."
     elif sel_w < 24:
-        total_h = "12–16h"; siestas = "3–4 siestas → reduce a 2 hacia los 6 meses"
-        notas_sueno = "Posible regresión de los 4 meses (cambio de ciclos de sueño). Normal y temporal."
+        total_h = "12–16h"; notas_sueno = "Posible regresión de los 4 meses (cambio de ciclos de sueño). Normal y temporal."
     else:
-        total_h = "12–14h"; siestas = "2 siestas (mañana + tarde)"
-        notas_sueno = "Ciclos de sueño más parecidos al adulto."
+        total_h = "12–14h"; notas_sueno = "Ciclos de sueño más parecidos al adulto."
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total/día", total_h)
@@ -914,10 +847,8 @@ def render_guide():
     st.caption(f"⏱️ Ventana de vigilia: **{aw_lo}–{aw_hi} min** despierto antes de la próxima siesta")
     st.info(f"💡 {notas_sueno}")
 
-    # ── ALIMENTACIÓN ──────────────────────────────────────────
     st.markdown("### 🍼 Alimentación")
     is_breast = "materna" in feed.lower()
-    is_formula = "fórmula" in feed.lower() or "Fórmula" in feed
 
     if sel_w < 1:
         tomas_dia = "8–12"; ml_toma = "5–10 ml (calostro)"; intervalo = "cada 1–3h"
@@ -951,7 +882,6 @@ def render_guide():
         st.success(f"👨 **Papá puede alimentar:** {papa_metodo}")
     st.info(f"💡 {nota_ali}")
 
-    # ── DEPOSICIONES ──────────────────────────────────────────
     st.markdown("### 💩 Deposiciones")
     if sel_w < 1:
         dep_frec = "3–4/día (puede llegar a 8–10)"; dep_color = "Negro/verde oscuro (meconio)"
@@ -962,7 +892,7 @@ def render_guide():
     elif sel_w < 8:
         if is_breast:
             dep_frec = "1–8/día (muy variable)"; dep_color = "Mostaza, granulada, líquida"
-            dep_nota = "Con lactancia materna es completamente normal no hacer caca varios días. La leche madura tiene muy poco desperdicio."
+            dep_nota = "Con lactancia materna es completamente normal no hacer caca varios días."
         else:
             dep_frec = "1–3/día"; dep_color = "Amarillo-marrón, más consistente"
             dep_nota = "Con fórmula son más consistentes y menos frecuentes. ≥1/día es normal."
@@ -979,28 +909,22 @@ def render_guide():
     st.info(f"💡 {dep_nota}")
     st.error("🚨 **Consultar al pediatra si:** color blanco/gris/rojo, sangre visible, sin deposición + llanto intenso + abdomen duro.")
 
-    # ── PESO ──────────────────────────────────────────────────
     st.markdown("### ⚖️ Peso y crecimiento")
     st.caption("Introduce el peso de nacimiento para calcular la curva esperada.")
-
     peso_nac = st.number_input("Peso al nacer (gramos)", value=3300, step=50,
                                 min_value=1500, max_value=5000)
-    # Curva esperada basada en peso de nacimiento
     if sel_w == 0:
-        peso_esp = peso_nac
-        nota_peso = "Peso de referencia."
+        peso_esp = peso_nac; nota_peso = "Peso de referencia."
     elif sel_w <= 2:
-        # Pérdida fisiológica máx 10% → recupera en ~2 semanas
         perdida = peso_nac * 0.07
         recuperacion = perdida / 2 * sel_w
         peso_esp = int(peso_nac - perdida + recuperacion)
         nota_peso = "Pérdida fisiológica normal hasta 10%. Recupera peso nacimiento ~2 semanas."
     elif sel_w <= 12:
-        # +150–200g/semana primer trimestre
         peso_esp = int(peso_nac + (sel_w - 2) * 180)
         nota_peso = "Ganancia esperada: 150–200g/semana en el primer trimestre."
     elif sel_w <= 24:
-        base = peso_nac + 10 * 180   # peso a las 12 semanas
+        base = peso_nac + 10 * 180
         peso_esp = int(base + (sel_w - 12) * 120)
         nota_peso = "Ganancia esperada: 100–130g/semana en el segundo trimestre."
     else:
@@ -1009,13 +933,12 @@ def render_guide():
         nota_peso = "Ganancia esperada: ~70–90g/semana."
 
     c9, c10 = st.columns(2)
-    c9.metric("Peso esperado semana " + str(sel_w),
+    c9.metric(f"Peso esperado semana {sel_w}",
               f"{peso_esp:,} g  ({round(peso_esp/1000,2)} kg)")
     c10.metric("Vs. nacimiento", f"{peso_esp - peso_nac:+,} g")
     st.info(f"💡 {nota_peso}")
     st.caption("⚠️ Estos valores son orientativos. El pediatra valorará la curva individual con percentiles.")
 
-    # ── DESARROLLO ────────────────────────────────────────────
     st.markdown("### 🧠 Desarrollo esperado")
     if sel_w < 4:
         hitos = ["Fija la mirada a 20–30 cm", "Reflejo de búsqueda y succión",
@@ -1050,7 +973,6 @@ def render_guide():
         for a in alertas:
             st.markdown(f"- {a}")
 
-    # ── PIEL CON PIEL / PORTEO ────────────────────────────────
     st.markdown("### 🤗 Contacto y porteo")
     if sel_w < 8:
         st.success("Piel con piel ilimitado — regula temperatura, glucemia, frecuencia cardiaca y favorece la lactancia. "
