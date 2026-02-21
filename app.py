@@ -40,13 +40,15 @@ def save_data():
         'phase':      st.session_state.phase,
         'phaseStart': st.session_state.phaseStart,
         'utc_offset': st.session_state.get('utc_offset', 1),
+        'dw_start':   st.session_state.get('dw_start', 21),
+        'dw_end':     st.session_state.get('dw_end', 3),
+        'work_hour':  st.session_state.get('work_hour', 7),
+        'papa_mode':  st.session_state.get('papa_mode', '💼 Trabajando'),
     }
     if s['baby'] and s['baby'].get('birth'):
         birth = s['baby']['birth']
-        # Puede ser date, datetime o ya un string
         if hasattr(birth, 'strftime'):
             s['baby']['birth'] = birth.strftime("%Y-%m-%d")
-        # Si ya es string lo dejamos como está
     for log in s['logs']:
         if hasattr(log['ts'], 'isoformat'):
             log['ts'] = log['ts'].isoformat()
@@ -59,19 +61,27 @@ def save_data():
 if 'initialized' not in st.session_state:
     db = load_data()
     if db:
-        st.session_state.baby       = db.get('baby')
-        st.session_state.logs       = db.get('logs', [])
-        st.session_state.phase      = db.get('phase', 'idle')
-        st.session_state.phaseStart = db.get('phaseStart')
-        st.session_state.utc_offset = db.get('utc_offset', 1)
-        st.session_state.page       = "main"
+        st.session_state.baby        = db.get('baby')
+        st.session_state.logs        = db.get('logs', [])
+        st.session_state.phase       = db.get('phase', 'idle')
+        st.session_state.phaseStart  = db.get('phaseStart')
+        st.session_state.utc_offset  = db.get('utc_offset', 1)
+        st.session_state.dw_start    = db.get('dw_start', 21)
+        st.session_state.dw_end      = db.get('dw_end', 3)
+        st.session_state.work_hour   = db.get('work_hour', 7)
+        st.session_state.papa_mode   = db.get('papa_mode', '💼 Trabajando')
+        st.session_state.page        = "main"
     else:
-        st.session_state.baby       = None
-        st.session_state.logs       = []
-        st.session_state.phase      = "idle"
-        st.session_state.phaseStart = None
-        st.session_state.utc_offset = 1
-        st.session_state.page       = "setup"
+        st.session_state.baby        = None
+        st.session_state.logs        = []
+        st.session_state.phase       = "idle"
+        st.session_state.phaseStart  = None
+        st.session_state.utc_offset  = 1
+        st.session_state.dw_start    = 21
+        st.session_state.dw_end      = 3
+        st.session_state.work_hour   = 7
+        st.session_state.papa_mode   = '💼 Trabajando'
+        st.session_state.page        = "setup"
     st.session_state.initialized = True
 
 # ─── HELPERS ──────────────────────────────────────────────────
