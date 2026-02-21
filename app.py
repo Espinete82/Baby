@@ -84,13 +84,86 @@ def age_days():
 def age_weeks():
     return age_days() // 7
 
-def get_aw_max(days):
+def get_aw_range(days):
+    """
+    Rango de vigilia normal (min, max) en minutos según edad.
+    Fuente: ciclos ultradianos RN, ventana aumenta con madurez.
+    """
     w = days // 7
-    if w < 4:  return 75
-    if w < 8:  return 90
-    if w < 12: return 105
-    if w < 16: return 120
-    return 150
+    if w < 2:  return 45,  75    # 0-2 sem
+    if w < 4:  return 50,  80    # 2-4 sem
+    if w < 8:  return 60,  90    # 4-8 sem
+    if w < 12: return 75, 105    # 8-12 sem
+    if w < 16: return 90, 120    # 12-16 sem
+    if w < 24: return 105, 150   # 16-24 sem
+    return 120, 180
+
+def get_sleep_range(days, is_night):
+    """
+    Rango de duración de sueño (min, max, label) según edad y momento.
+    Noche = bloque entre tomas. Día = siesta diurna.
+    """
+    w = days // 7
+    if is_night:
+        if w < 2:  return  90, 150, "1.5–2.5h"
+        if w < 4:  return 110, 180, "2–3h"
+        if w < 8:  return 135, 210, "2.5–3.5h"
+        if w < 12: return 150, 300, "2.5–5h"
+        if w < 16: return 180, 360, "3–6h"
+        return          240, 420, "4–7h"
+    else:
+        if w < 2:  return  20,  60, "20–60 min"
+        if w < 4:  return  30,  70, "30–70 min"
+        if w < 8:  return  30, 120, "30min–2h"
+        if w < 12: return  45,  90, "45–90 min"
+        if w < 16: return  60,  90, "1–1.5h"
+        return           60, 120, "1–2h"
+
+def get_feed_range(days):
+    """Rango normal de duración de toma (min, max)."""
+    if "materna" in (st.session_state.baby or {}).get('feed', '').lower():
+        return 10, 30
+    return 10, 25
+
+# Compatibilidad con referencias antiguas
+def get_aw_max(days):
+    return get_aw_range(days)[1]
+
+def phase_status(phase, elapsed, days):
+    """
+    Devuelve (estado, color_hex, mensaje) según si el tiempo en la fase
+    es normal, límite o excedido respecto al rango esperado.
+    estados: 'ok', 'warning', 'alert'
+    """
+    if phase == "activity":
+        lo, hi = get_aw_range(days)
+        if elapsed < lo:
+            return 'ok', '#22C55E', f"✅ Normal — aún dentro del rango ({lo}–{hi} min despierto)"
+        if elapsed <= hi:
+            pct = int((elapsed - lo) / (hi - lo) * 100)
+            return 'warning', '#F59E0B', f"⚠️ Acercándose al límite — {hi - elapsed} min restantes (rango: {lo}–{hi} min)"
+        return 'alert', '#EF4444', f"🚨 Ventana cerrada — lleva {elapsed} min (máx. {hi} min)"
+
+    elif phase == "feeding":
+        lo, hi = get_feed_range(days)
+        if elapsed < lo:
+            return 'ok', '#22C55E', f"✅ Toma en curso — normal hasta ~{hi} min"
+        if elapsed <= hi:
+            return 'ok', '#22C55E', f"✅ Duración normal ({lo}–{hi} min)"
+        return 'warning', '#F59E0B', f"⚠️ Toma larga ({elapsed} min) — si está relajado y suelto, ya está satisfecho"
+
+    elif phase == "sleeping":
+        h = now_local().hour
+        is_night = h >= 20 or h < 7
+        lo, hi, _ = get_sleep_range(days, is_night)
+        tipo = "nocturno" if is_night else "siesta"
+        if elapsed < lo:
+            return 'ok', '#8B5CF6', f"😴 Sueño {tipo} normal — mínimo esperado: {lo} min"
+        if elapsed <= hi:
+            return 'ok', '#8B5CF6', f"😴 Dentro del rango ({lo}–{hi} min) — despertará pronto"
+        return 'warning', '#F59E0B', f"⚠️ Sueño largo ({elapsed} min) — máx. esperado {hi} min. Puede estar bien."
+
+    return 'ok', '#6B7280', ""
 
 def elapsed_min():
     if not st.session_state.phaseStart:
@@ -140,6 +213,190 @@ def papa_feed_method(days, feed_type):
 def build_agenda(baby, now, current_phase, sim_elapsed):
     days      = age_days()
     aw_max    = get_aw_max(days)
+    feed_type = baby.get('feed', 'Mixta')
+    is_fase1  = days < 120
+
+    # Configuración de turnos — usa los valores del usuario
+    DW_START  = st.session_state.get('dw_start', 21)   # hora inicio turno papá
+    DW_END    = st.session_state.get('dw_end', 3)       # hora fin turno papá
+    WORK_HOUR = st.session_state.get('work_hour', 7)    # hora que papá entra a trabajar
+
+    def is_papas_shift(h):
+        """Turno de papá: desde DW_START hasta DW_END (cruza medianoche)."""
+        if DW_START > DW_END:   # caso normal: ej. 21→03
+            return h >= DW_START or h < DW_END
+        return DW_START <= h < DW_END  # caso raro: no cruza medianoche
+
+    def is_night_mode(h):
+        """
+        Modo noche: bebé duerme bloques más largos y no hay actividad.
+        Alineado con DW_START para evitar inconsistencia con el turno de papá.
+        """
+        if DW_START > DW_END:
+            return h >= DW_START or h < DW_END
+        return DW_START <= h < DW_END
+
+    cursor    = now
+    limit     = now + timedelta(hours=24)
+    agenda    = []
+    MAX_ITER  = 80
+
+    total_tomas    = 0
+    mama_sleep_min = 0
+    mama_free_min  = 0
+    papa_was_on_duty = False
+    papa_shift_start = None
+    papa_shifts      = []
+
+    for _ in range(MAX_ITER):
+        if cursor >= limit or len(agenda) >= 30:
+            break
+
+        h        = cursor.hour
+        is_night = is_night_mode(h)
+
+        # ── ACTIVITY ─────────────────────────────────────────
+        if current_phase == "activity":
+            if is_night:
+                current_phase = "sleeping"
+                sim_elapsed   = 0
+                continue
+
+            act_dur  = max(5, aw_max - 15)
+            wait     = max(1, act_dur - sim_elapsed)
+            cursor  += timedelta(minutes=wait)
+            h        = cursor.hour
+            on_duty  = is_papas_shift(h)
+            act_desc = ("Piel con piel, canto, móvil contrastes"
+                        if is_fase1 else "Tummy time, espejo, suelo")
+
+            if on_duty:
+                mama_sleep_min += act_dur
+                mama_ev = "💤 Prepárate para dormir"
+                papa_ev = f"🎯 {act_desc} · Vigila señales de sueño"
+                bg, brd = "#EDE9FE", "#8B5CF6"
+            else:
+                mama_free_min += act_dur
+                mama_ev = f"🎯 {act_desc}"
+                papa_ev = f"🎯 {act_desc} · Señales: bostezos, mirada perdida"
+                bg, brd = "#FFF7ED", "#F97316"
+
+            if on_duty and not papa_was_on_duty:
+                papa_shift_start = cursor - timedelta(minutes=act_dur)
+                papa_was_on_duty = True
+            elif not on_duty and papa_was_on_duty:
+                papa_shifts.append((papa_shift_start, cursor))
+                papa_was_on_duty = False
+
+            agenda.append(dict(hora=cursor.strftime("%H:%M"), icono="🎯",
+                               evento=f"Fin actividad → a dormir ({act_dur} min)",
+                               mama=mama_ev, papa=papa_ev, bg=bg, border=brd))
+            current_phase = "sleeping"
+            sim_elapsed   = 0
+
+        # ── EAT ──────────────────────────────────────────────
+        elif current_phase == "feeding":
+            feed_dur = 25 if "materna" in feed_type.lower() else 20
+            wait     = max(1, feed_dur - sim_elapsed)
+            cursor  += timedelta(minutes=wait)
+            h        = cursor.hour
+            on_duty  = is_papas_shift(h)
+            total_tomas += 1
+
+            if on_duty:
+                papa_role = papa_feed_method(days, feed_type)
+                mama_role = "💤 DURMIENDO"
+                bg, brd   = "#EFF6FF", "#3B82F6"
+                mama_sleep_min += feed_dur
+            else:
+                papa_role = (papa_feed_method(days, feed_type)
+                             if "materna" not in feed_type.lower()
+                             else "🤝 Acompaña, saca gases")
+                mama_role = "🤱 Da el pecho / biberón"
+                bg, brd   = "#F0FDF4", "#22C55E"
+                mama_free_min += feed_dur
+
+            if on_duty and not papa_was_on_duty:
+                papa_shift_start = cursor - timedelta(minutes=feed_dur)
+                papa_was_on_duty = True
+            elif not on_duty and papa_was_on_duty:
+                papa_shifts.append((papa_shift_start, cursor))
+                papa_was_on_duty = False
+
+            agenda.append(dict(hora=cursor.strftime("%H:%M"), icono="🍼",
+                               evento=f"Toma #{total_tomas} terminada",
+                               mama=mama_role, papa=papa_role, bg=bg, border=brd))
+            current_phase = "sleeping" if is_night else "activity"
+            sim_elapsed   = 0
+
+        # ── SLEEP / IDLE ──────────────────────────────────────
+        elif current_phase in ("sleeping", "idle"):
+            lo, hi, sleep_lbl = get_sleep_range(days, is_night)
+            mid        = (lo + hi) // 2
+            wait       = max(1, mid - sim_elapsed)
+            sleep_start = cursor
+            cursor     += timedelta(minutes=wait)
+            wake_early  = (sleep_start + timedelta(minutes=lo)).strftime("%H:%M")
+            wake_late   = (sleep_start + timedelta(minutes=hi)).strftime("%H:%M")
+            wake_mid    = cursor.strftime("%H:%M")   # alarma papá = punto medio
+            h           = cursor.hour
+            on_duty     = is_papas_shift(h) or is_papas_shift(sleep_start.hour)
+
+            papa_hint = (papa_feed_method(days, feed_type)
+                         if "materna" not in feed_type.lower()
+                         else "jeringa/dedo/biberón según semanas")
+
+            if on_duty:
+                mama_sleep_min += mid
+                mama_role = "💤 DURMIENDO — bloque largo"
+                papa_role = (f"😴 DUERME AHORA — ⏰ pon alarma a las {wake_mid}"
+                             f" | Al sonar: {papa_hint}")
+                bg, brd   = "#EDE9FE", "#8B5CF6"
+            else:
+                mama_free_min += mid
+                mama_role = "🛁 Ducha · Comida · Descanso (tú primero)"
+                papa_role = "😴 Descansa / duerme mientras puedas"
+                bg, brd   = "#ECFDF5", "#10B981"
+
+            if on_duty and not papa_was_on_duty:
+                papa_shift_start = sleep_start
+                papa_was_on_duty = True
+            elif not on_duty and papa_was_on_duty:
+                papa_shifts.append((papa_shift_start, sleep_start))
+                papa_was_on_duty = False
+
+            agenda.append(dict(
+                hora=sleep_start.strftime("%H:%M"), icono="🌙",
+                evento=f"Bebé se duerme — despertará entre {wake_early} y {wake_late} ({sleep_lbl})",
+                mama=mama_role, papa=papa_role, bg=bg, border=brd))
+            current_phase = "feeding"
+            sim_elapsed   = 0
+
+    if papa_was_on_duty and papa_shift_start:
+        papa_shifts.append((papa_shift_start, cursor))
+
+    # Bloque continuo de papá = fin turno → hora de ir a trabajar (no hasta las 7 fijo)
+    papa_block_min = 0
+    if papa_shifts:
+        last_end = papa_shifts[-1][1]
+        work_time = last_end.replace(hour=WORK_HOUR, minute=0, second=0, microsecond=0)
+        if work_time <= last_end:
+            work_time += timedelta(days=1)
+        papa_block_min = max(0, int((work_time - last_end).total_seconds() / 60))
+
+    papa_duty_min = sum(int((e - s).total_seconds() / 60) for s, e in papa_shifts)
+
+    summary = dict(
+        tomas        = total_tomas,
+        mama_sleep_h = round(mama_sleep_min / 60, 1),
+        mama_free_h  = round(mama_free_min / 60, 1),
+        papa_block_h = round(papa_block_min / 60, 1),
+        papa_duty_h  = round(papa_duty_min / 60, 1),
+        dw_start     = DW_START,
+        dw_end       = DW_END,
+        work_hour    = WORK_HOUR,
+    )
+    return agenda, summaryaw_max(days)
     feed_type = baby.get('feed', 'Mixta')
     is_fase1  = days < 120
 
@@ -249,13 +506,7 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
 
         # ── SLEEP / IDLE ──────────────────────────────────────
         elif current_phase in ("sleeping", "idle"):
-            # Sueño nocturno según edad: primeras 2 semanas cada 2h, luego 2.5h, luego 3h
-            if is_night:
-                if days < 14:   sleep_dur = 120
-                elif days < 21: sleep_dur = 150
-                else:           sleep_dur = 180
-            else:
-                sleep_dur = 90 if is_fase1 else 60
+            sleep_dur, sleep_lbl = get_sleep_durations(days, is_night)
 
             wait          = max(1, sleep_dur - sim_elapsed)
             sleep_start   = cursor                        # momento en que bebé se duerme
@@ -291,7 +542,7 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
             # Evento = momento en que bebé SE DUERME (con alarma incluida para papá)
             agenda.append(dict(
                 hora=sleep_start.strftime("%H:%M"), icono="🌙",
-                evento=f"Bebé se duerme — despertará ~{wake_time_str}",
+                evento=f"Bebé se duerme — despertará ~{wake_time_str} ({sleep_lbl})",
                 mama=mama_role, papa=papa_role, bg=bg, border=brd
             ))
             current_phase = "feeding"
@@ -395,7 +646,8 @@ def render_setup():
                 unsafe_allow_html=True)
     with st.form("setup_form"):
         name  = st.text_input("Nombre del bebé")
-        birth = st.date_input("Fecha de nacimiento", max_value=datetime.date.today())
+        birth = st.date_input("Fecha de nacimiento (o fecha prevista de parto)",
+                              value=datetime.date.today())
         feed  = st.selectbox("Alimentación", [
             "Lactancia materna exclusiva",
             "Mixta (pecho + biberón)",
@@ -403,8 +655,18 @@ def render_setup():
         ])
         tz = st.number_input("Tu zona horaria (UTC+?)", value=1, min_value=-12, max_value=14, step=1,
                              help="Europa Central = 1 (invierno) o 2 (verano/CEST)")
+        col_dw1, col_dw2 = st.columns(2)
+        dw_start = col_dw1.number_input("Dream Window papá — empieza (hora)", value=21, min_value=18, max_value=23, step=1,
+                                         help="Hora en que papá asume el turno nocturno")
+        dw_end   = col_dw2.number_input("Dream Window papá — termina (hora)", value=3, min_value=1, max_value=8, step=1,
+                                         help="Hora en que termina el turno de papá")
+        work_hour = st.number_input("Papá entra a trabajar a las (hora)", value=7, min_value=4, max_value=12, step=1,
+                                    help="Define cuándo papá debe levantarse. Limita su bloque de sueño real.")
         if st.form_submit_button("Empezar →", use_container_width=True) and name:
             st.session_state.utc_offset = int(tz)
+            st.session_state.dw_start   = int(dw_start)
+            st.session_state.dw_end     = int(dw_end)
+            st.session_state.work_hour  = int(work_hour)
             st.session_state.baby = {"name": name, "birth": birth, "feed": feed}
             st.session_state.page = "main"
             change_phase("idle")
@@ -415,15 +677,32 @@ def render_settings():
     baby = st.session_state.baby
     feed_opts = ["Lactancia materna exclusiva", "Mixta (pecho + biberón)", "Fórmula / Biberón"]
     with st.form("settings_form"):
-        new_name = st.text_input("Nombre", value=baby['name'])
+        new_name  = st.text_input("Nombre", value=baby['name'])
+        birth_val = baby.get('birth', datetime.date.today())
+        if isinstance(birth_val, str):
+            birth_val = datetime.datetime.strptime(birth_val, "%Y-%m-%d").date()
+        new_birth = st.date_input("Fecha de nacimiento (o fecha prevista)", value=birth_val)
         idx      = feed_opts.index(baby['feed']) if baby['feed'] in feed_opts else 0
         new_feed = st.selectbox("Alimentación", feed_opts, index=idx)
-        new_tz   = st.number_input("Zona horaria (UTC+?)",
+        new_tz    = st.number_input("Zona horaria (UTC+?)",
                                    value=st.session_state.get('utc_offset', 1),
                                    min_value=-12, max_value=14, step=1)
+        col_s1, col_s2 = st.columns(2)
+        new_dw_start = col_s1.number_input("Dream Window papá — empieza",
+                                            value=st.session_state.get('dw_start', 21),
+                                            min_value=18, max_value=23, step=1)
+        new_dw_end   = col_s2.number_input("Dream Window papá — termina",
+                                            value=st.session_state.get('dw_end', 3),
+                                            min_value=1, max_value=8, step=1)
+        new_work     = st.number_input("Papá entra a trabajar a las",
+                                       value=st.session_state.get('work_hour', 7),
+                                       min_value=4, max_value=12, step=1)
         if st.form_submit_button("Guardar", use_container_width=True):
-            st.session_state.baby.update(name=new_name, feed=new_feed)
+            st.session_state.baby.update(name=new_name, birth=new_birth, feed=new_feed)
             st.session_state.utc_offset = int(new_tz)
+            st.session_state.dw_start   = int(new_dw_start)
+            st.session_state.dw_end     = int(new_dw_end)
+            st.session_state.work_hour  = int(new_work)
             save_data()
             st.success("¡Guardado!")
             st.session_state.page = "main"
@@ -445,15 +724,28 @@ def render_main():
     el     = elapsed_min()
 
     # Cabecera
-    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+    c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 1, 1])
     with c1:
+        # Mostrar días o días antes del parto si es futuro
+        days_to_birth = (baby.get('birth', datetime.date.today()) - datetime.date.today()).days
+        if isinstance(baby.get('birth'), str):
+            birth_d = datetime.datetime.strptime(baby['birth'], "%Y-%m-%d").date()
+            days_to_birth = (birth_d - datetime.date.today()).days
+        if days > 0:
+            age_str = f"{days}d · {days//7}sem"
+        elif days_to_birth > 0:
+            age_str = f"⏳ Nacerá en {days_to_birth} días"
+        else:
+            age_str = "Día 0 · ¡Bienvenido al mundo!"
         st.subheader(f"👶 {baby['name']}")
-        st.caption(f"{days}d · {days//7}sem · {baby['feed']} · {now.strftime('%H:%M')} (UTC+{st.session_state.get('utc_offset',1)})")
+        st.caption(f"{age_str} · {baby['feed']} · {now.strftime('%H:%M')} (UTC+{st.session_state.get('utc_offset',1)})")
     with c2:
-        if st.button("📊"): st.session_state.page = "metrics"; st.rerun()
+        if st.button("📖"): st.session_state.page = "guide";   st.rerun()
     with c3:
-        if st.button("📋"): st.session_state.page = "history"; st.rerun()
+        if st.button("📊"): st.session_state.page = "metrics"; st.rerun()
     with c4:
+        if st.button("📋"): st.session_state.page = "history"; st.rerun()
+    with c5:
         if st.button("⚙️"): st.session_state.page = "settings"; st.rerun()
 
     st.markdown("---")
@@ -672,6 +964,223 @@ def render_metrics():
     else:
         st.caption("Sin eventos registrados aún.")
 
+# ─── GUÍA DE DESARROLLO ───────────────────────────────────────
+def render_guide():
+    st.subheader("📖 Guía de desarrollo")
+    if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
+
+    days  = age_days()
+    weeks = days // 7
+    feed  = (st.session_state.baby or {}).get('feed', 'Lactancia materna exclusiva')
+
+    # ── Selector de semana (permite explorar semanas futuras) ──
+    max_w = max(weeks, 0)
+    sel_w = st.slider("Ver guía para la semana:", 0, 24, max_w,
+                      help="Mueve para explorar cómo evolucionará el bebé")
+    sel_days = sel_w * 7
+
+    # ── Etiqueta de etapa ─────────────────────────────────────
+    if sel_w < 4:
+        etapa = "🌱 Recién nacido (0–4 semanas)"
+        color = "#FEF9C3"
+    elif sel_w < 8:
+        etapa = "🌿 Primer mes (4–8 semanas)"
+        color = "#DCFCE7"
+    elif sel_w < 12:
+        etapa = "🌸 Segundo mes (8–12 semanas)"
+        color = "#E0F2FE"
+    elif sel_w < 24:
+        etapa = "🌻 3–6 meses (12–24 semanas)"
+        color = "#EDE9FE"
+    else:
+        etapa = "🌳 +6 meses"
+        color = "#FEE2E2"
+
+    st.markdown(f"<div style='background:{color};padding:10px 14px;"
+                f"border-radius:8px;font-weight:bold;margin-bottom:16px;'>"
+                f"{etapa} — Semana {sel_w}</div>", unsafe_allow_html=True)
+
+    # ── SUEÑO ─────────────────────────────────────────────────
+    st.markdown("### 😴 Sueño")
+    aw_lo, aw_hi = get_aw_range(sel_days)
+    lo_n, hi_n, lbl_n = get_sleep_range(sel_days, is_night=True)
+    lo_d, hi_d, lbl_d = get_sleep_range(sel_days, is_night=False)
+
+    if sel_w < 4:
+        total_h = "16–20h"; siestas = "Sin patrón fijo — ciclos de 45–75 min despierto"
+        notas_sueno = "No hay ritmo circadiano. Día = Noche para él. Normal despertar cada 2–3h."
+    elif sel_w < 8:
+        total_h = "15–17h"; siestas = "3–4 siestas/día de duración muy variable"
+        notas_sueno = "Empieza a agrupar ligeramente por las noches. Aún normal despertar 2–3× noche."
+    elif sel_w < 12:
+        total_h = "~15h"; siestas = "3–4 siestas de 45–90 min"
+        notas_sueno = "Inicia producción de melatonina. Empieza a distinguir día/noche."
+    elif sel_w < 24:
+        total_h = "12–16h"; siestas = "3–4 siestas → reduce a 2 hacia los 6 meses"
+        notas_sueno = "Posible regresión de los 4 meses (cambio de ciclos de sueño). Normal y temporal."
+    else:
+        total_h = "12–14h"; siestas = "2 siestas (mañana + tarde)"
+        notas_sueno = "Ciclos de sueño más parecidos al adulto."
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total/día", total_h)
+    c2.metric("Bloque nocturno", lbl_n)
+    c3.metric("Siesta diurna", lbl_d)
+    st.caption(f"⏱️ Ventana de vigilia: **{aw_lo}–{aw_hi} min** despierto antes de la próxima siesta")
+    st.info(f"💡 {notas_sueno}")
+
+    # ── ALIMENTACIÓN ──────────────────────────────────────────
+    st.markdown("### 🍼 Alimentación")
+    is_breast = "materna" in feed.lower()
+    is_formula = "fórmula" in feed.lower() or "Fórmula" in feed
+
+    if sel_w < 1:
+        tomas_dia = "8–12"; ml_toma = "5–10 ml (calostro)"; intervalo = "cada 1–3h"
+        nota_ali = "Estómago tamaño canica. El calostro es suficiente y perfecto. No suplementar sin indicación."
+    elif sel_w < 2:
+        tomas_dia = "8–12"; ml_toma = "20–60 ml"; intervalo = "cada 2–3h"
+        nota_ali = "Sube la leche madura (días 3–5). Tomas muy frecuentes = estimulación de producción."
+    elif sel_w < 4:
+        tomas_dia = "8–10"; ml_toma = "60–90 ml"; intervalo = "cada 2–3h"
+        nota_ali = "Si vacía el pecho/biberón y parece insatisfecho → sube 20–30 ml la próxima toma."
+    elif sel_w < 8:
+        tomas_dia = "7–9"; ml_toma = "90–120 ml"; intervalo = "cada 2.5–3.5h"
+        nota_ali = "Tomas más espaciadas y eficientes. Normal que alguna dure solo 5–10 min."
+    elif sel_w < 12:
+        tomas_dia = "6–8"; ml_toma = "120–150 ml"; intervalo = "cada 3–4h"
+        nota_ali = "Más despierto e interesado en el entorno. Puede distraerse durante la toma."
+    elif sel_w < 24:
+        tomas_dia = "5–7"; ml_toma = "150–180 ml"; intervalo = "cada 3.5–4.5h"
+        nota_ali = "A los 6 meses se introduce alimentación complementaria. La leche sigue siendo principal."
+    else:
+        tomas_dia = "4–5"; ml_toma = "180–240 ml"; intervalo = "cada 4–5h"
+        nota_ali = "Papillas y purés como complemento. Nunca en sustitución de la leche antes del año."
+
+    c4, c5, c6 = st.columns(3)
+    c4.metric("Tomas/día", tomas_dia)
+    c5.metric("Cantidad/toma", ml_toma if not is_breast else "A demanda")
+    c6.metric("Intervalo", intervalo)
+
+    if is_breast:
+        papa_metodo = papa_feed_method(sel_days, feed)
+        st.success(f"👨 **Papá puede alimentar:** {papa_metodo}")
+    st.info(f"💡 {nota_ali}")
+
+    # ── DEPOSICIONES ──────────────────────────────────────────
+    st.markdown("### 💩 Deposiciones")
+    if sel_w < 1:
+        dep_frec = "3–4/día (puede llegar a 8–10)"; dep_color = "Negro/verde oscuro (meconio)"
+        dep_nota = "El meconio es normal. Debe desaparecer en 48–72h. Cuenta los pañales para valorar ingesta."
+    elif sel_w < 2:
+        dep_frec = "3–6/día"; dep_color = "Verde transición → mostaza"
+        dep_nota = "Cambio de color = la leche madura está llegando. Buena señal."
+    elif sel_w < 8:
+        if is_breast:
+            dep_frec = "1–8/día (muy variable)"; dep_color = "Mostaza, granulada, líquida"
+            dep_nota = "Con lactancia materna es completamente normal no hacer caca varios días. La leche madura tiene muy poco desperdicio."
+        else:
+            dep_frec = "1–3/día"; dep_color = "Amarillo-marrón, más consistente"
+            dep_nota = "Con fórmula son más consistentes y menos frecuentes. ≥1/día es normal."
+    elif sel_w < 24:
+        dep_frec = "1–4/día o cada 2–3 días"; dep_color = "Amarillo/marrón"
+        dep_nota = "La frecuencia se regula con la edad. Lo importante es que sean blandas, no duras."
+    else:
+        dep_frec = "1–2/día"; dep_color = "Marrón, más adulta"
+        dep_nota = "Con la alimentación complementaria el color y consistencia cambiarán según lo que coma."
+
+    c7, c8 = st.columns(2)
+    c7.metric("Frecuencia esperada", dep_frec)
+    c8.metric("Color normal", dep_color)
+    st.info(f"💡 {dep_nota}")
+    st.error("🚨 **Consultar al pediatra si:** color blanco/gris/rojo, sangre visible, sin deposición + llanto intenso + abdomen duro.")
+
+    # ── PESO ──────────────────────────────────────────────────
+    st.markdown("### ⚖️ Peso y crecimiento")
+    st.caption("Introduce el peso de nacimiento para calcular la curva esperada.")
+
+    peso_nac = st.number_input("Peso al nacer (gramos)", value=3300, step=50,
+                                min_value=1500, max_value=5000)
+    # Curva esperada basada en peso de nacimiento
+    if sel_w == 0:
+        peso_esp = peso_nac
+        nota_peso = "Peso de referencia."
+    elif sel_w <= 2:
+        # Pérdida fisiológica máx 10% → recupera en ~2 semanas
+        perdida = peso_nac * 0.07
+        recuperacion = perdida / 2 * sel_w
+        peso_esp = int(peso_nac - perdida + recuperacion)
+        nota_peso = "Pérdida fisiológica normal hasta 10%. Recupera peso nacimiento ~2 semanas."
+    elif sel_w <= 12:
+        # +150–200g/semana primer trimestre
+        peso_esp = int(peso_nac + (sel_w - 2) * 180)
+        nota_peso = "Ganancia esperada: 150–200g/semana en el primer trimestre."
+    elif sel_w <= 24:
+        base = peso_nac + 10 * 180   # peso a las 12 semanas
+        peso_esp = int(base + (sel_w - 12) * 120)
+        nota_peso = "Ganancia esperada: 100–130g/semana en el segundo trimestre."
+    else:
+        base = peso_nac + 10 * 180 + 12 * 120
+        peso_esp = int(base + (sel_w - 24) * 80)
+        nota_peso = "Ganancia esperada: ~70–90g/semana."
+
+    c9, c10 = st.columns(2)
+    c9.metric("Peso esperado semana " + str(sel_w),
+              f"{peso_esp:,} g  ({round(peso_esp/1000,2)} kg)")
+    c10.metric("Vs. nacimiento", f"{peso_esp - peso_nac:+,} g")
+    st.info(f"💡 {nota_peso}")
+    st.caption("⚠️ Estos valores son orientativos. El pediatra valorará la curva individual con percentiles.")
+
+    # ── DESARROLLO ────────────────────────────────────────────
+    st.markdown("### 🧠 Desarrollo esperado")
+    if sel_w < 4:
+        hitos = ["Fija la mirada a 20–30 cm", "Reflejo de búsqueda y succión",
+                 "Responde a sonidos fuertes", "Mueve brazos y piernas simétricamente"]
+        alertas = ["No responde a la voz", "No fija la mirada en ningún momento",
+                   "Llanto muy agudo o ausente"]
+    elif sel_w < 8:
+        hitos = ["Sonrisa social (semana 6–8)", "Sigue objetos con los ojos",
+                 "Vocaliza pequeños sonidos", "Levanta ligeramente la cabeza boca abajo"]
+        alertas = ["Sin sonrisa social a los 2 meses", "No sigue objetos con la vista"]
+    elif sel_w < 12:
+        hitos = ["Ríe en voz alta", "Sigue objetos 180°", "Sostiene la cabeza mejor",
+                 "Manotea objetos", "Reconoce caras familiares"]
+        alertas = ["Sin vocalización", "No sostiene la cabeza en absoluto a las 12 semanas"]
+    elif sel_w < 24:
+        hitos = ["Se da la vuelta (4–5 meses)", "Agarra objetos", "Balbucea (ba, ma, da)",
+                 "Se sienta con apoyo", "Reconoce su nombre"]
+        alertas = ["Sin balbuceo a los 6 meses", "No intenta alcanzar objetos",
+                   "No aguanta peso en las piernas al sostenerlo de pie"]
+    else:
+        hitos = ["Se sienta solo", "Pinza índice-pulgar", "Imita gestos",
+                 "Gatea o intenta moverse", "Primeras palabras ~12 meses"]
+        alertas = ["Sin movilidad dirigida", "Sin gestos imitativos", "Sin palabras a los 12 meses"]
+
+    c11, c12 = st.columns(2)
+    with c11:
+        st.markdown("**✅ Hitos esperados:**")
+        for h in hitos:
+            st.markdown(f"- {h}")
+    with c12:
+        st.markdown("**🚨 Consultar si:**")
+        for a in alertas:
+            st.markdown(f"- {a}")
+
+    # ── PIEL CON PIEL / PORTEO ────────────────────────────────
+    st.markdown("### 🤗 Contacto y porteo")
+    if sel_w < 8:
+        st.success("Piel con piel ilimitado — regula temperatura, glucemia, frecuencia cardiaca y favorece la lactancia. "
+                   "El porteo fisiológico desde el nacimiento es seguro y reduce el llanto hasta un 43%.")
+    elif sel_w < 16:
+        st.success("Porteo fisiológico recomendado. Posición en M, espalda redondeada, cara visible. "
+                   "El contacto sigue siendo esencial para el desarrollo neurológico.")
+    else:
+        st.info("Sigue siendo beneficioso. A esta edad le interesa más explorar el entorno. "
+                "Alterna porteo con tiempo en el suelo para favorecer el desarrollo motor.")
+
+    st.markdown("---")
+    st.caption("Fuentes: OMS, AAP, ESPGHAN, Sears (The Baby Book), Gonzalez (Un regalo para toda la vida)")
+
+
 # ─── ROUTER ───────────────────────────────────────────────────
 {
     "setup":    render_setup,
@@ -680,4 +1189,5 @@ def render_metrics():
     "diaper":   render_diaper,
     "history":  render_history,
     "metrics":  render_metrics,
+    "guide":    render_guide,
 }.get(st.session_state.page, render_setup)()
