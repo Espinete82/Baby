@@ -66,13 +66,13 @@ def render_main():
     baby = st.session_state.baby
     days = get_age_days(baby['birth'])
     aw_max = get_aw_max(days)
-    es_fase_1 = days < 120  # Lógica del "Camino Medio"
+    es_fase_1 = days < 120  # Lógica del "Camino Medio" (Menos de 4 meses)
     
     # Cabecera
     col1, col2 = st.columns([4, 1])
     with col1:
         st.subheader(f"👶 {baby['name']}")
-        st.caption(f"Edad: {days} días | Fase {'1 (Biología)' if es_fase_1 else '2 (Rutinas)'}")
+        st.caption(f"Edad: {days} días | Fase {'1 (Biología y Apego)' if es_fase_1 else '2 (Transición a Rutinas)'}")
     with col2:
         if st.button("📋", help="Historial"):
             st.session_state.page = "history"
@@ -84,7 +84,7 @@ def render_main():
     if st.session_state.phaseStart:
         elapsed_min = int((now - st.session_state.phaseStart).total_seconds() / 60)
 
-    # --- MENSAJES DINÁMICOS BASADOS EN LA EDAD (El Camino Medio) ---
+    # --- MENSAJES DINÁMICOS BASADOS EN LA EDAD Y LA EVIDENCIA ---
     st.markdown("---")
     if st.session_state.phase == "idle":
         st.info("☀️ **Despierto y tranquilo**\n\nObserva sus señales (bostezos, mirada fija). La alimentación es a demanda, si busca, ofrécele.")
@@ -100,10 +100,23 @@ def render_main():
                        f"Intenta que coma, jugad un rato suave, y luego a dormir.")
     
     elif st.session_state.phase == "sleeping":
-        st.markdown(f"<div style='background-color:#F3E8FF; padding:15px; border-radius:10px;'>"
+        is_newborn = days < 30
+        is_daytime = 7 <= now.hour < 20
+        
+        st.markdown(f"<div style='background-color:#F3E8FF; padding:15px; border-radius:10px; margin-bottom:15px;'>"
                     f"😴 <b>Durmiendo</b> (hace {elapsed_min} min)<br><br>"
                     f"<i>SUEÑO SEGURO:</i> Boca arriba, superficie firme, sin mantas sueltas. "
                     f"{'Usa el porteo para alargar siestas si está irritable.' if es_fase_1 else 'Intenta que haga alguna siesta en su cuna para crear hábito.'}</div>", unsafe_allow_html=True)
+        
+        # --- LÓGICA DE ALERTAS PARA DESPERTAR AL BEBÉ ---
+        if is_newborn and elapsed_min >= 210: # 3.5 horas
+            st.error("🚨 **Alerta Pediátrica (Recién Nacido):** En el primer mes, no debe pasar más de 3.5 - 4h sin comer para evitar bajadas de azúcar. Es hora de despertarle suavemente para ofrecerle toma.")
+        elif not is_newborn and is_daytime and elapsed_min >= 120: # 2 horas de día
+            st.warning("⚠️ **Siesta diurna muy larga:** Lleva 2 horas durmiendo. Plantéate despertarle suavemente para que coma; así aseguras sus calorías de día y proteges su sueño nocturno.")
+        elif not is_newborn and not is_daytime:
+            st.info("🌙 **Modo Noche:** Es de noche y ya no es un recién nacido. ¡Déjale dormir todo lo que quiera! Cero alarmas.")
+        else:
+            st.success("Déjale descansar tranquilamente. Su ciclo de sueño está en rango normal.")
     
     elif st.session_state.phase == "activity":
         if es_fase_1:
@@ -218,7 +231,7 @@ def render_main():
                 current_phase = "activity"
                 sim_elapsed_min = 0
 
-    # Renderizar la agenda en pantalla usando HTML para un diseño atractivo
+    # Renderizar la agenda en pantalla usando HTML
     for item in agenda:
         st.markdown(f"""
         <div style='background-color: {item['bg']}; border-left: 5px solid {item['border']}; padding: 12px; margin-bottom: 10px; border-radius: 6px;'>
