@@ -210,193 +210,60 @@ def papa_feed_method(days, feed_type):
 # Cada ciclo EASY genera 4 eventos: Eat · Activity · Sleep · You
 # Se reajusta partiendo del estado real actual del bebé.
 
-def build_agenda(baby, now, current_phase, sim_elapsed):
+def get_papa_mode_config():
+    """
+    Devuelve configuración de turnos según el modo de papá.
+    Cada modo define:
+      - day_duty: papá cubre también siestas diurnas (no solo nocturnas)
+      - day_shift_start/end: franja de día en que papá asume el bebé
+      - work_label: etiqueta para el planificador
+      - mama_day_role: qué puede hacer mamá cuando papá cubre de día
+      - papa_day_role: qué hace papá de día
+    """
+    mode = st.session_state.get('papa_mode', '💼 Trabajando')
+    dw_s = st.session_state.get('dw_start', 21)
+    dw_e = st.session_state.get('dw_end', 3)
+    wh   = st.session_state.get('work_hour', 7)
+
+    if '💼 Trabajando' in mode:
+        return dict(
+            mode_label   = "💼 Trabajando",
+            day_duty     = False,          # papá no cubre de día
+            dw_start     = dw_s,
+            dw_end       = dw_e,
+            work_hour    = wh,
+            mama_day     = "🤱 Gestiona sola — ¡eres increíble!",
+            papa_day     = "💼 En el trabajo",
+            mama_note    = None,
+        )
+    elif '🏠 Teletrabajo' in mode:
+        return dict(
+            mode_label   = "🏠 Teletrabajo",
+            day_duty     = True,
+            day_shift_s  = 12,             # papá cubre siesta de mediodía
+            day_shift_e  = 14,
+            dw_start     = dw_s,
+            dw_end       = dw_e,
+            work_hour    = wh,
+            mama_day     = "😴 Duerme / descansa (siesta de mediodía)",
+            papa_day     = "🏠 Cuida al bebé entre reuniones (12–14h)",
+            mama_note    = "📅 Papá cubre la siesta de mediodía (12–14h) → aprovecha para dormir.",
+        )
+    else:  # Vacaciones
+        return dict(
+            mode_label   = "🌴 Vacaciones",
+            day_duty     = True,
+            day_shift_s  = 8,              # papá cubre toda la mañana
+            day_shift_e  = 14,
+            dw_start     = dw_s,
+            dw_end       = dw_e,
+            work_hour    = 23,             # no tiene que madrugar → duerme más
+            mama_day     = "😴 Duerme / ducha / come / respira",
+            papa_day     = "🌴 Turno completo mañana (08–14h) — mamá descansa",
+            mama_note    = "🌴 Papá lleva el turno de mañana (8–14h). Mamá: duerme sin culpa.",
+        )
     days      = age_days()
     aw_max    = get_aw_max(days)
-    feed_type = baby.get('feed', 'Mixta')
-    is_fase1  = days < 120
-
-    # Configuración de turnos — usa los valores del usuario
-    DW_START  = st.session_state.get('dw_start', 21)   # hora inicio turno papá
-    DW_END    = st.session_state.get('dw_end', 3)       # hora fin turno papá
-    WORK_HOUR = st.session_state.get('work_hour', 7)    # hora que papá entra a trabajar
-
-    def is_papas_shift(h):
-        """Turno de papá: desde DW_START hasta DW_END (cruza medianoche)."""
-        if DW_START > DW_END:   # caso normal: ej. 21→03
-            return h >= DW_START or h < DW_END
-        return DW_START <= h < DW_END  # caso raro: no cruza medianoche
-
-    def is_night_mode(h):
-        """
-        Modo noche: bebé duerme bloques más largos y no hay actividad.
-        Alineado con DW_START para evitar inconsistencia con el turno de papá.
-        """
-        if DW_START > DW_END:
-            return h >= DW_START or h < DW_END
-        return DW_START <= h < DW_END
-
-    cursor    = now
-    limit     = now + timedelta(hours=24)
-    agenda    = []
-    MAX_ITER  = 80
-
-    total_tomas    = 0
-    mama_sleep_min = 0
-    mama_free_min  = 0
-    papa_was_on_duty = False
-    papa_shift_start = None
-    papa_shifts      = []
-
-    for _ in range(MAX_ITER):
-        if cursor >= limit or len(agenda) >= 30:
-            break
-
-        h        = cursor.hour
-        is_night = is_night_mode(h)
-
-        # ── ACTIVITY ─────────────────────────────────────────
-        if current_phase == "activity":
-            if is_night:
-                current_phase = "sleeping"
-                sim_elapsed   = 0
-                continue
-
-            act_dur  = max(5, aw_max - 15)
-            wait     = max(1, act_dur - sim_elapsed)
-            cursor  += timedelta(minutes=wait)
-            h        = cursor.hour
-            on_duty  = is_papas_shift(h)
-            act_desc = ("Piel con piel, canto, móvil contrastes"
-                        if is_fase1 else "Tummy time, espejo, suelo")
-
-            if on_duty:
-                mama_sleep_min += act_dur
-                mama_ev = "💤 Prepárate para dormir"
-                papa_ev = f"🎯 {act_desc} · Vigila señales de sueño"
-                bg, brd = "#EDE9FE", "#8B5CF6"
-            else:
-                mama_free_min += act_dur
-                mama_ev = f"🎯 {act_desc}"
-                papa_ev = f"🎯 {act_desc} · Señales: bostezos, mirada perdida"
-                bg, brd = "#FFF7ED", "#F97316"
-
-            if on_duty and not papa_was_on_duty:
-                papa_shift_start = cursor - timedelta(minutes=act_dur)
-                papa_was_on_duty = True
-            elif not on_duty and papa_was_on_duty:
-                papa_shifts.append((papa_shift_start, cursor))
-                papa_was_on_duty = False
-
-            agenda.append(dict(hora=cursor.strftime("%H:%M"), icono="🎯",
-                               evento=f"Fin actividad → a dormir ({act_dur} min)",
-                               mama=mama_ev, papa=papa_ev, bg=bg, border=brd))
-            current_phase = "sleeping"
-            sim_elapsed   = 0
-
-        # ── EAT ──────────────────────────────────────────────
-        elif current_phase == "feeding":
-            feed_dur = 25 if "materna" in feed_type.lower() else 20
-            wait     = max(1, feed_dur - sim_elapsed)
-            cursor  += timedelta(minutes=wait)
-            h        = cursor.hour
-            on_duty  = is_papas_shift(h)
-            total_tomas += 1
-
-            if on_duty:
-                papa_role = papa_feed_method(days, feed_type)
-                mama_role = "💤 DURMIENDO"
-                bg, brd   = "#EFF6FF", "#3B82F6"
-                mama_sleep_min += feed_dur
-            else:
-                papa_role = (papa_feed_method(days, feed_type)
-                             if "materna" not in feed_type.lower()
-                             else "🤝 Acompaña, saca gases")
-                mama_role = "🤱 Da el pecho / biberón"
-                bg, brd   = "#F0FDF4", "#22C55E"
-                mama_free_min += feed_dur
-
-            if on_duty and not papa_was_on_duty:
-                papa_shift_start = cursor - timedelta(minutes=feed_dur)
-                papa_was_on_duty = True
-            elif not on_duty and papa_was_on_duty:
-                papa_shifts.append((papa_shift_start, cursor))
-                papa_was_on_duty = False
-
-            agenda.append(dict(hora=cursor.strftime("%H:%M"), icono="🍼",
-                               evento=f"Toma #{total_tomas} terminada",
-                               mama=mama_role, papa=papa_role, bg=bg, border=brd))
-            current_phase = "sleeping" if is_night else "activity"
-            sim_elapsed   = 0
-
-        # ── SLEEP / IDLE ──────────────────────────────────────
-        elif current_phase in ("sleeping", "idle"):
-            lo, hi, sleep_lbl = get_sleep_range(days, is_night)
-            mid        = (lo + hi) // 2
-            wait       = max(1, mid - sim_elapsed)
-            sleep_start = cursor
-            cursor     += timedelta(minutes=wait)
-            wake_early  = (sleep_start + timedelta(minutes=lo)).strftime("%H:%M")
-            wake_late   = (sleep_start + timedelta(minutes=hi)).strftime("%H:%M")
-            wake_mid    = cursor.strftime("%H:%M")   # alarma papá = punto medio
-            h           = cursor.hour
-            on_duty     = is_papas_shift(h) or is_papas_shift(sleep_start.hour)
-
-            papa_hint = (papa_feed_method(days, feed_type)
-                         if "materna" not in feed_type.lower()
-                         else "jeringa/dedo/biberón según semanas")
-
-            if on_duty:
-                mama_sleep_min += mid
-                mama_role = "💤 DURMIENDO — bloque largo"
-                papa_role = (f"😴 DUERME AHORA — ⏰ pon alarma a las {wake_mid}"
-                             f" | Al sonar: {papa_hint}")
-                bg, brd   = "#EDE9FE", "#8B5CF6"
-            else:
-                mama_free_min += mid
-                mama_role = "🛁 Ducha · Comida · Descanso (tú primero)"
-                papa_role = "😴 Descansa / duerme mientras puedas"
-                bg, brd   = "#ECFDF5", "#10B981"
-
-            if on_duty and not papa_was_on_duty:
-                papa_shift_start = sleep_start
-                papa_was_on_duty = True
-            elif not on_duty and papa_was_on_duty:
-                papa_shifts.append((papa_shift_start, sleep_start))
-                papa_was_on_duty = False
-
-            agenda.append(dict(
-                hora=sleep_start.strftime("%H:%M"), icono="🌙",
-                evento=f"Bebé se duerme — despertará entre {wake_early} y {wake_late} ({sleep_lbl})",
-                mama=mama_role, papa=papa_role, bg=bg, border=brd))
-            current_phase = "feeding"
-            sim_elapsed   = 0
-
-    if papa_was_on_duty and papa_shift_start:
-        papa_shifts.append((papa_shift_start, cursor))
-
-    # Bloque continuo de papá = fin turno → hora de ir a trabajar (no hasta las 7 fijo)
-    papa_block_min = 0
-    if papa_shifts:
-        last_end = papa_shifts[-1][1]
-        work_time = last_end.replace(hour=WORK_HOUR, minute=0, second=0, microsecond=0)
-        if work_time <= last_end:
-            work_time += timedelta(days=1)
-        papa_block_min = max(0, int((work_time - last_end).total_seconds() / 60))
-
-    papa_duty_min = sum(int((e - s).total_seconds() / 60) for s, e in papa_shifts)
-
-    summary = dict(
-        tomas        = total_tomas,
-        mama_sleep_h = round(mama_sleep_min / 60, 1),
-        mama_free_h  = round(mama_free_min / 60, 1),
-        papa_block_h = round(papa_block_min / 60, 1),
-        papa_duty_h  = round(papa_duty_min / 60, 1),
-        dw_start     = DW_START,
-        dw_end       = DW_END,
-        work_hour    = WORK_HOUR,
-    )
-    return agenda, summaryaw_max(days)
     feed_type = baby.get('feed', 'Mixta')
     is_fase1  = days < 120
 
@@ -662,11 +529,14 @@ def render_setup():
                                          help="Hora en que termina el turno de papá")
         work_hour = st.number_input("Papá entra a trabajar a las (hora)", value=7, min_value=4, max_value=12, step=1,
                                     help="Define cuándo papá debe levantarse. Limita su bloque de sueño real.")
+        papa_mode = st.selectbox("Modo papá hoy", ["💼 Trabajando", "🏠 Teletrabajo", "🌴 Vacaciones"],
+                                 help="Ajusta el reparto de tareas en el planificador")
         if st.form_submit_button("Empezar →", use_container_width=True) and name:
             st.session_state.utc_offset = int(tz)
             st.session_state.dw_start   = int(dw_start)
             st.session_state.dw_end     = int(dw_end)
             st.session_state.work_hour  = int(work_hour)
+            st.session_state.papa_mode  = papa_mode
             st.session_state.baby = {"name": name, "birth": birth, "feed": feed}
             st.session_state.page = "main"
             change_phase("idle")
@@ -697,12 +567,17 @@ def render_settings():
         new_work     = st.number_input("Papá entra a trabajar a las",
                                        value=st.session_state.get('work_hour', 7),
                                        min_value=4, max_value=12, step=1)
+        new_mode     = st.selectbox("Modo papá hoy",
+                                    ["💼 Trabajando", "🏠 Teletrabajo", "🌴 Vacaciones"],
+                                    index=["💼 Trabajando", "🏠 Teletrabajo", "🌴 Vacaciones"].index(
+                                        st.session_state.get('papa_mode', '💼 Trabajando')))
         if st.form_submit_button("Guardar", use_container_width=True):
             st.session_state.baby.update(name=new_name, birth=new_birth, feed=new_feed)
             st.session_state.utc_offset = int(new_tz)
             st.session_state.dw_start   = int(new_dw_start)
             st.session_state.dw_end     = int(new_dw_end)
             st.session_state.work_hour  = int(new_work)
+            st.session_state.papa_mode  = new_mode
             save_data()
             st.success("¡Guardado!")
             st.session_state.page = "main"
