@@ -249,21 +249,31 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
 
         # ── SLEEP / IDLE ──────────────────────────────────────
         elif current_phase in ("sleeping", "idle"):
-            sleep_dur = 180 if is_night else (90 if is_fase1 else 60)
-            wait      = max(1, sleep_dur - sim_elapsed)
-            cursor   += timedelta(minutes=wait)
-            h         = cursor.hour
-            on_duty   = is_papas_shift(h)
+            # Sueño nocturno según edad: primeras 2 semanas cada 2h, luego 2.5h, luego 3h
+            if is_night:
+                if days < 14:   sleep_dur = 120
+                elif days < 21: sleep_dur = 150
+                else:           sleep_dur = 180
+            else:
+                sleep_dur = 90 if is_fase1 else 60
+
+            wait          = max(1, sleep_dur - sim_elapsed)
+            sleep_start   = cursor                        # momento en que bebé se duerme
+            cursor       += timedelta(minutes=wait)
+            wake_time_str = cursor.strftime("%H:%M")      # hora proyectada de despertar
+            h             = cursor.hour
+            on_duty       = is_papas_shift(h) or is_papas_shift(sleep_start.hour)
+
+            papa_hint = (papa_feed_method(days, feed_type)
+                         if "materna" not in feed_type.lower()
+                         else "jeringa/dedo/biberón según semanas")
 
             if on_duty:
                 mama_sleep_min += sleep_dur
                 mama_role = "💤 DURMIENDO — bloque largo"
-                papa_hint = (papa_feed_method(days, feed_type)
-                             if "materna" not in feed_type.lower()
-                             else "jeringa/dedo/biberón según semanas")
-                alarm_str = cursor.strftime("%H:%M")
-                papa_role = (f"😴 DUERME — pon alarma a las {alarm_str} "
-                             f"| Al despertar: {papa_hint}")
+                # Alarma mostrada en el momento en que papá SE VA A DORMIR (sleep_start)
+                papa_role = (f"😴 DUERME AHORA — ⏰ pon alarma a las {wake_time_str} "
+                             f"| Al sonar: {papa_hint}")
                 bg, brd   = "#EDE9FE", "#8B5CF6"
             else:
                 mama_free_min += sleep_dur
@@ -272,15 +282,16 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
                 bg, brd   = "#ECFDF5", "#10B981"
 
             if on_duty and not papa_was_on_duty:
-                papa_shift_start = cursor - timedelta(minutes=sleep_dur)
+                papa_shift_start = sleep_start
                 papa_was_on_duty = True
             elif not on_duty and papa_was_on_duty:
-                papa_shifts.append((papa_shift_start, cursor))
+                papa_shifts.append((papa_shift_start, sleep_start))
                 papa_was_on_duty = False
 
+            # Evento = momento en que bebé SE DUERME (con alarma incluida para papá)
             agenda.append(dict(
-                hora=cursor.strftime("%H:%M"), icono="☀️",
-                evento=f"Despierta (siesta: {sleep_dur} min)",
+                hora=sleep_start.strftime("%H:%M"), icono="🌙",
+                evento=f"Bebé se duerme — despertará ~{wake_time_str}",
                 mama=mama_role, papa=papa_role, bg=bg, border=brd
             ))
             current_phase = "feeding"
@@ -337,10 +348,10 @@ def render_agenda(agenda, summary):
               help="Siestas de día en que mamá puede ducharse, comer o descansar")
 
     c4, c5 = st.columns(2)
-    c4.metric("🧔 Bloque continuo papá", f"{summary['papa_block_h']}h",
-              help="Desde que termina su turno nocturno hasta el próximo despertar → su sueño del tirón")
+    c4.metric("🧔 Papá duerme del tirón", f"{summary['papa_block_h']}h",
+              help="Desde que termina su turno (~03:00) hasta las 07:00 → su bloque seguido")
     c5.metric("🕐 Guardia total papá", f"{summary['papa_duty_h']}h",
-              help="Total de horas en turno nocturno activo (21–03h)")
+              help="Horas activo de noche (21–03h) gestionando tomas")
 
     st.markdown("---")
 
