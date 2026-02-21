@@ -133,73 +133,71 @@ def papa_feed_method(days, feed_type):
 # Se reajusta partiendo del estado real actual del bebé.
 
 def build_agenda(baby, now, current_phase, sim_elapsed):
-    days  = age_days()
-    aw_max = get_aw_max(days)
+    days      = age_days()
+    aw_max    = get_aw_max(days)
     feed_type = baby.get('feed', 'Mixta')
-    is_fase1  = days < 120  # antes de los 4 meses: más flexible
+    is_fase1  = days < 120
 
-    cursor    = now
-    limit     = now + timedelta(hours=12)
-    agenda    = []
-    MAX_ITER  = 40
+    cursor      = now
+    limit       = now + timedelta(hours=24)   # ← 24h
+    agenda      = []
+    MAX_ITER    = 60
+
+    # Contadores para el resumen final
+    total_tomas        = 0
+    mama_sleep_min     = 0   # minutos que mamá duerme (turno papá)
+    mama_free_min      = 0   # minutos libres de mamá (de día)
 
     for _ in range(MAX_ITER):
-        if cursor >= limit or len(agenda) >= 14:
+        if cursor >= limit or len(agenda) >= 28:
             break
 
-        h = cursor.hour
-        is_night     = h >= 20 or h < 7
-        is_papas_shift = h >= 21 or h < 3   # se evalúa DESPUÉS de avanzar cursor
+        h              = cursor.hour
+        is_night       = h >= 20 or h < 7
 
         # ── EAT ──────────────────────────────────────────────
         if current_phase == "feeding":
             feed_dur = 25 if "materna" in feed_type.lower() else 20
-            wait = max(1, feed_dur - sim_elapsed)
-            cursor += timedelta(minutes=wait)
-            h = cursor.hour
-            is_papas_shift = h >= 21 or h < 3
+            wait     = max(1, feed_dur - sim_elapsed)
+            cursor  += timedelta(minutes=wait)
+            h        = cursor.hour
+            is_papas = h >= 21 or h < 3
+            total_tomas += 1
 
-            if is_papas_shift:
+            if is_papas:
                 papa_role = papa_feed_method(days, feed_type)
                 mama_role = "💤 DURMIENDO"
                 bg, brd   = "#EFF6FF", "#3B82F6"
             else:
-                papa_role = papa_feed_method(days, feed_type) if "materna" not in feed_type.lower() else "🤝 Acompaña, saca gases"
+                papa_role = (papa_feed_method(days, feed_type)
+                             if "materna" not in feed_type.lower()
+                             else "🤝 Acompaña, saca gases")
                 mama_role = "🤱 Da el pecho / biberón"
                 bg, brd   = "#F0FDF4", "#22C55E"
 
             agenda.append(dict(
                 hora=cursor.strftime("%H:%M"), icono="🍼",
-                evento="Toma terminada",
+                evento=f"Toma #{total_tomas} terminada",
                 mama=mama_role, papa=papa_role,
                 bg=bg, border=brd
             ))
-
-            # De noche → directo a dormir (EASY nocturno sin actividad)
-            if is_night:
-                current_phase = "sleeping"
-            else:
-                current_phase = "activity"
-            sim_elapsed = 0
+            current_phase = "sleeping" if is_night else "activity"
+            sim_elapsed   = 0
 
         # ── ACTIVITY ─────────────────────────────────────────
         elif current_phase == "activity":
-            # De noche no hay actividad
             if is_night:
                 current_phase = "sleeping"
                 sim_elapsed   = 0
                 continue
 
-            act_dur = max(1, aw_max - 15)   # actividad hasta ~15 min antes del límite
+            act_dur = max(1, aw_max - 15)
             wait    = max(1, act_dur - sim_elapsed)
             cursor += timedelta(minutes=wait)
-            h = cursor.hour
-            is_papas_shift = h >= 21 or h < 3
-
-            if is_fase1:
-                act_desc = "Piel con piel, canto, móvil de contrastes"
-            else:
-                act_desc = "Tummy time, espejo, juego en suelo"
+            h       = cursor.hour
+            act_desc = ("Piel con piel, canto, móvil de contrastes"
+                        if is_fase1 else "Tummy time, espejo, juego en suelo")
+            mama_free_min += act_dur
 
             agenda.append(dict(
                 hora=cursor.strftime("%H:%M"), icono="🎯",
@@ -211,24 +209,27 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
             current_phase = "sleeping"
             sim_elapsed   = 0
 
-        # ── SLEEP ─────────────────────────────────────────────
+        # ── SLEEP / IDLE ──────────────────────────────────────
         elif current_phase in ("sleeping", "idle"):
             sleep_dur = 180 if is_night else (90 if is_fase1 else 60)
-            wait = max(1, sleep_dur - sim_elapsed)
-            cursor += timedelta(minutes=wait)
-            h = cursor.hour
-            is_papas_shift = h >= 21 or h < 3
+            wait      = max(1, sleep_dur - sim_elapsed)
+            cursor   += timedelta(minutes=wait)
+            h         = cursor.hour
+            is_papas  = h >= 21 or h < 3
 
-            if is_papas_shift:
+            if is_papas:
+                mama_sleep_min += sleep_dur
                 mama_role = "💤 DURMIENDO — bloque largo"
-                papa_role = "🌙 Vigila. Al despertar: toma con " + (
-                    papa_feed_method(days, feed_type) if "materna" not in feed_type.lower()
-                    else "jeringa/dedo/biberón según semanas")
-                bg, brd = "#EDE9FE", "#8B5CF6"
+                papa_hint = (papa_feed_method(days, feed_type)
+                             if "materna" not in feed_type.lower()
+                             else "jeringa/dedo/biberón según semanas")
+                papa_role = f"🌙 Vigila. Al despertar: {papa_hint}"
+                bg, brd   = "#EDE9FE", "#8B5CF6"
             else:
+                mama_free_min += sleep_dur
                 mama_role = "🛁 Ducha · Comida · Descanso  (tú primero)"
                 papa_role = "👀 Vigila la siesta · Prepara lo que haga falta"
-                bg, brd = "#ECFDF5", "#10B981"
+                bg, brd   = "#ECFDF5", "#10B981"
 
             agenda.append(dict(
                 hora=cursor.strftime("%H:%M"), icono="☀️",
@@ -239,13 +240,42 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
             current_phase = "feeding"
             sim_elapsed   = 0
 
-    return agenda
+    summary = dict(
+        tomas=total_tomas,
+        mama_sleep_h=round(mama_sleep_min / 60, 1),
+        mama_free_h=round(mama_free_min / 60, 1),
+    )
+    return agenda, summary
 
-def render_agenda(agenda):
+def render_agenda(agenda, summary):
     if not agenda:
         st.info("Sin previsión disponible.")
         return
+
+    # ── Resumen destacado ─────────────────────────────────────
+    st.markdown("#### 📊 Resumen proyectado (24h)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🍼 Tomas mínimas", summary["tomas"],
+              help="Tomas proyectadas en las próximas 24h según el ritmo actual")
+    c2.metric("💤 Dream Window mamá", f"{summary['mama_sleep_h']}h",
+              help="Horas en que papá cubre → mamá puede dormir del tirón")
+    c3.metric("🌿 Tiempo libre mamá", f"{summary['mama_free_h']}h",
+              help="Siestas de día + actividad en que mamá puede descansar o ducharse")
+
+    st.markdown("---")
+
+    # ── Separador día / noche ─────────────────────────────────
+    prev_is_night = None
     for item in agenda:
+        h          = int(item["hora"].split(":")[0])
+        is_night   = h >= 20 or h < 7
+        if prev_is_night is not None and is_night != prev_is_night:
+            label = "🌙 Noche" if is_night else "☀️ Día"
+            st.markdown(f"<div style='text-align:center;color:#6B7280;font-size:.8em;"
+                        f"padding:6px 0;border-top:1px dashed #D1D5DB;'>{label}</div>",
+                        unsafe_allow_html=True)
+        prev_is_night = is_night
+
         st.markdown(f"""
         <div style='background:{item["bg"]};border-left:5px solid {item["border"]};
                     padding:12px;margin-bottom:8px;border-radius:8px;'>
@@ -389,10 +419,10 @@ def render_main():
 
     # Agenda EASY
     st.markdown("---")
-    st.subheader("📅 Planificador EASY — Próximas 12h")
+    st.subheader("📅 Planificador EASY — Próximas 24h")
     st.caption("Se ajusta al ritmo real del bebé. Morado = turno de papá (Dream Window).")
-    agenda = build_agenda(baby, now, phase, el)
-    render_agenda(agenda)
+    agenda, summary = build_agenda(baby, now, phase, el)
+    render_agenda(agenda, summary)
 
 def render_history():
     st.subheader("📋 Historial de hoy")
