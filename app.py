@@ -9,7 +9,13 @@ st.set_page_config(page_title="BebéGuía", page_icon="🌙", layout="centered")
 
 DB_FILE = 'bebe_db.json'
 
-# ─── PERSISTENCIA ────────────────────────────────────────────
+# ─── TIMEZONE ─────────────────────────────────────────────────
+# Streamlit Cloud corre en UTC. Guardamos offset en config.
+def now_local():
+    offset = st.session_state.get('utc_offset', 1)
+    return datetime.datetime.utcnow() + timedelta(hours=offset)
+
+# ─── PERSISTENCIA ─────────────────────────────────────────────
 def load_data():
     if not os.path.exists(DB_FILE):
         return None
@@ -28,13 +34,13 @@ def load_data():
         return None
 
 def save_data():
-    data = {
-        'baby': st.session_state.baby,
-        'logs': st.session_state.logs,
-        'phase': st.session_state.phase,
+    s = {
+        'baby':       st.session_state.baby,
+        'logs':       copy.deepcopy(st.session_state.logs),
+        'phase':      st.session_state.phase,
         'phaseStart': st.session_state.phaseStart,
+        'utc_offset': st.session_state.get('utc_offset', 1),
     }
-    s = copy.deepcopy(data)
     if s['baby'] and s['baby'].get('birth'):
         s['baby']['birth'] = s['baby']['birth'].strftime("%Y-%m-%d")
     for log in s['logs']:
@@ -48,17 +54,19 @@ def save_data():
 if 'initialized' not in st.session_state:
     db = load_data()
     if db:
-        st.session_state.baby      = db.get('baby')
-        st.session_state.logs      = db.get('logs', [])
-        st.session_state.phase     = db.get('phase', 'idle')
-        st.session_state.phaseStart= db.get('phaseStart')
-        st.session_state.page      = "main"
+        st.session_state.baby       = db.get('baby')
+        st.session_state.logs       = db.get('logs', [])
+        st.session_state.phase      = db.get('phase', 'idle')
+        st.session_state.phaseStart = db.get('phaseStart')
+        st.session_state.utc_offset = db.get('utc_offset', 1)
+        st.session_state.page       = "main"
     else:
-        st.session_state.baby      = None
-        st.session_state.logs      = []
-        st.session_state.phase     = "idle"
-        st.session_state.phaseStart= None
-        st.session_state.page      = "setup"
+        st.session_state.baby       = None
+        st.session_state.logs       = []
+        st.session_state.phase      = "idle"
+        st.session_state.phaseStart = None
+        st.session_state.utc_offset = 1
+        st.session_state.page       = "setup"
     st.session_state.initialized = True
 
 # ─── HELPERS ──────────────────────────────────────────────────
@@ -67,6 +75,9 @@ def age_days():
     if not b or not b.get('birth'):
         return 0
     return (datetime.date.today() - b['birth']).days
+
+def age_weeks():
+    return age_days() // 7
 
 def get_aw_max(days):
     w = days // 7
@@ -79,124 +90,186 @@ def get_aw_max(days):
 def elapsed_min():
     if not st.session_state.phaseStart:
         return 0
-    return int((datetime.datetime.now() - st.session_state.phaseStart
-                ).total_seconds() / 60)
+    return int((now_local() - st.session_state.phaseStart).total_seconds() / 60)
 
 def add_log(log_type, dur_min=0, color=None):
-    log = {"type": log_type, "ts": datetime.datetime.now(),
-           "durMin": dur_min, "color": color}
+    log = {"type": log_type, "ts": now_local(), "durMin": dur_min, "color": color}
     st.session_state.logs.append(log)
     save_data()
 
 def change_phase(new_phase):
-    now = datetime.datetime.now()
     dur = elapsed_min()
-    # Guard: evita duplicados en recargas rápidas
     if st.session_state.phaseStart and st.session_state.phase != "idle" and dur > 1:
         add_log(st.session_state.phase, dur)
     st.session_state.phase      = new_phase
-    st.session_state.phaseStart = now
+    st.session_state.phaseStart = now_local()
     save_data()
 
-# ─── DIAPER MAP (FIX BUG 2) ───────────────────────────────────
-DIAPER_TYPE_MAP = {
-    "Pipí 💧":           "diaper_wet",
-    "Caca 💩":           "diaper_dirty",
-    "Pipí + Caca 💧💩":  "diaper_both",
-    "Seco 🏜️":           "diaper_dry",
-}
-DIAPER_ICONS = {
-    "diaper_wet": "💧", "diaper_dirty": "💩",
-    "diaper_both": "💧💩", "diaper_dry": "🏜️",
-}
-PHASE_ICONS = {"feeding": "🍼", "sleeping": "😴", "activity": "🎯", "idle": "☀️"}
+# ─── LACTANCIA POR EDAD → ROL DE PAPÁ ─────────────────────────
+def papa_feed_method(days, feed_type):
+    """Qué puede hacer papá en la toma según edad y método."""
+    weeks = days // 7
+    if "materna" in feed_type.lower():
+        if weeks < 2:
+            return "🪡 Da calostro con jeringa o dedo (no biberón aún)"
+        elif weeks < 4:
+            return "👆 Alimentación con dedo (finger feeding) si mamá no puede"
+        elif weeks < 6:
+            return "🍼 Puede ofrecer leche extraída en biberón (flujo lento)"
+        else:
+            return "🍼 Da biberón con leche materna extraída"
+    elif "mixta" in feed_type.lower():
+        if weeks < 2:
+            return "🪡 Jeringa o dedo con leche materna/fórmula"
+        elif weeks < 4:
+            return "👆 Finger feeding o biberón con tetina de flujo lento"
+        else:
+            return "🍼 Prepara y da biberón completo (fórmula o leche extraída)"
+    else:
+        return "🍼 Prepara y da biberón completo"
 
-# ─── AGENDA PREDICTIVA (FIX BUG 1 + loop infinito) ───────────
+# ─── AGENDA EASY COMPLETA ─────────────────────────────────────
+# Cada ciclo EASY genera 4 eventos: Eat · Activity · Sleep · You
+# Se reajusta partiendo del estado real actual del bebé.
+
 def build_agenda(baby, now, current_phase, sim_elapsed):
-    days = age_days()
+    days  = age_days()
     aw_max = get_aw_max(days)
     feed_type = baby.get('feed', 'Mixta')
-    cursor = now
-    limit  = now + timedelta(hours=12)
-    agenda = []
-    MAX_ITER = 30  # salvaguarda anti-bucle infinito
+    is_fase1  = days < 120  # antes de los 4 meses: más flexible
+
+    cursor    = now
+    limit     = now + timedelta(hours=12)
+    agenda    = []
+    MAX_ITER  = 40
 
     for _ in range(MAX_ITER):
-        if cursor >= limit or len(agenda) >= 10:
+        if cursor >= limit or len(agenda) >= 14:
             break
 
-        if current_phase in ("idle", "activity"):
-            wait = max(1, aw_max - sim_elapsed)  # mínimo 1 min para avanzar
-            cursor += timedelta(minutes=wait)
-            # FIX BUG 1: evaluar turno DESPUÉS de avanzar cursor
-            is_papas = cursor.hour >= 21 or cursor.hour < 3
-            if is_papas:
-                mama, papa = "💤 DURMIENDO", "💪 Duerme al bebé"
-                bg, brd = "#EDE9FE", "#8B5CF6"
-            else:
-                mama, papa = "Libre / Ducha", "Vigila o tareas"
-                bg, brd = "#ECFDF5", "#10B981"
-            agenda.append(dict(hora=cursor.strftime("%H:%M"), icono="😴",
-                               evento="Se duerme", mama=mama, papa=papa,
-                               bg=bg, border=brd))
-            current_phase = "sleeping"
-            sim_elapsed = 0
+        h = cursor.hour
+        is_night     = h >= 20 or h < 7
+        is_papas_shift = h >= 21 or h < 3   # se evalúa DESPUÉS de avanzar cursor
 
-        elif current_phase == "sleeping":
-            is_night = cursor.hour >= 20 or cursor.hour < 7
-            dur = 180 if is_night else 60
-            wait = max(1, dur - sim_elapsed)
+        # ── EAT ──────────────────────────────────────────────
+        if current_phase == "feeding":
+            feed_dur = 25 if "materna" in feed_type.lower() else 20
+            wait = max(1, feed_dur - sim_elapsed)
             cursor += timedelta(minutes=wait)
-            is_papas = cursor.hour >= 21 or cursor.hour < 3
-            if is_papas:
-                if "Fórmula" in feed_type or "Mixta" in feed_type:
-                    mama, papa = "💤 DURMIENDO (del tirón)", "🍼 Da biberón completo"
-                else:
-                    mama, papa = "🤱 Da pecho en cama", "🧷 Cambia pañal y saca gases"
-                bg, brd = "#EFF6FF", "#3B82F6"
-            else:
-                mama, papa = "🤱 Alimenta al bebé", "Acompaña"
-                bg, brd = "#F9FAFB", "#D1D5DB"
-            agenda.append(dict(hora=cursor.strftime("%H:%M"), icono="🍼",
-                               evento="Pide toma", mama=mama, papa=papa,
-                               bg=bg, border=brd))
-            current_phase = "feeding"
-            sim_elapsed = 0
+            h = cursor.hour
+            is_papas_shift = h >= 21 or h < 3
 
-        elif current_phase == "feeding":
-            wait = max(1, 30 - sim_elapsed)
-            cursor += timedelta(minutes=wait)
-            is_night = cursor.hour >= 20 or cursor.hour < 7
+            if is_papas_shift:
+                papa_role = papa_feed_method(days, feed_type)
+                mama_role = "💤 DURMIENDO"
+                bg, brd   = "#EFF6FF", "#3B82F6"
+            else:
+                papa_role = papa_feed_method(days, feed_type) if "materna" not in feed_type.lower() else "🤝 Acompaña, saca gases"
+                mama_role = "🤱 Da el pecho / biberón"
+                bg, brd   = "#F0FDF4", "#22C55E"
+
+            agenda.append(dict(
+                hora=cursor.strftime("%H:%M"), icono="🍼",
+                evento="Toma terminada",
+                mama=mama_role, papa=papa_role,
+                bg=bg, border=brd
+            ))
+
+            # De noche → directo a dormir (EASY nocturno sin actividad)
             if is_night:
                 current_phase = "sleeping"
-                sim_elapsed = 0
             else:
-                agenda.append(dict(hora=cursor.strftime("%H:%M"), icono="🎯",
-                                   evento="Termina toma", mama="Juego suave",
-                                   papa="Juego suave", bg="#F9FAFB", border="#D1D5DB"))
                 current_phase = "activity"
-                sim_elapsed = 0
+            sim_elapsed = 0
+
+        # ── ACTIVITY ─────────────────────────────────────────
+        elif current_phase == "activity":
+            # De noche no hay actividad
+            if is_night:
+                current_phase = "sleeping"
+                sim_elapsed   = 0
+                continue
+
+            act_dur = max(1, aw_max - 15)   # actividad hasta ~15 min antes del límite
+            wait    = max(1, act_dur - sim_elapsed)
+            cursor += timedelta(minutes=wait)
+            h = cursor.hour
+            is_papas_shift = h >= 21 or h < 3
+
+            if is_fase1:
+                act_desc = "Piel con piel, canto, móvil de contrastes"
+            else:
+                act_desc = "Tummy time, espejo, juego en suelo"
+
+            agenda.append(dict(
+                hora=cursor.strftime("%H:%M"), icono="🎯",
+                evento=f"Fin actividad → a dormir  ({act_dur} min)",
+                mama=f"🎯 {act_desc}",
+                papa=f"🎯 {act_desc} · Señales: bostezos, mirada perdida",
+                bg="#FFF7ED", border="#F97316"
+            ))
+            current_phase = "sleeping"
+            sim_elapsed   = 0
+
+        # ── SLEEP ─────────────────────────────────────────────
+        elif current_phase in ("sleeping", "idle"):
+            sleep_dur = 180 if is_night else (90 if is_fase1 else 60)
+            wait = max(1, sleep_dur - sim_elapsed)
+            cursor += timedelta(minutes=wait)
+            h = cursor.hour
+            is_papas_shift = h >= 21 or h < 3
+
+            if is_papas_shift:
+                mama_role = "💤 DURMIENDO — bloque largo"
+                papa_role = "🌙 Vigila. Al despertar: toma con " + (
+                    papa_feed_method(days, feed_type) if "materna" not in feed_type.lower()
+                    else "jeringa/dedo/biberón según semanas")
+                bg, brd = "#EDE9FE", "#8B5CF6"
+            else:
+                mama_role = "🛁 Ducha · Comida · Descanso  (tú primero)"
+                papa_role = "👀 Vigila la siesta · Prepara lo que haga falta"
+                bg, brd = "#ECFDF5", "#10B981"
+
+            agenda.append(dict(
+                hora=cursor.strftime("%H:%M"), icono="☀️",
+                evento=f"Despierta  (siesta: {sleep_dur} min)",
+                mama=mama_role, papa=papa_role,
+                bg=bg, border=brd
+            ))
+            current_phase = "feeding"
+            sim_elapsed   = 0
 
     return agenda
 
 def render_agenda(agenda):
+    if not agenda:
+        st.info("Sin previsión disponible.")
+        return
     for item in agenda:
         st.markdown(f"""
         <div style='background:{item["bg"]};border-left:5px solid {item["border"]};
-                    padding:12px;margin-bottom:10px;border-radius:6px;'>
-            <div style='font-size:1.1em;color:#1F2937;margin-bottom:4px;'>
-                <b>{item["hora"]}</b> | {item["icono"]} <b>{item["evento"]}</b>
+                    padding:12px;margin-bottom:8px;border-radius:8px;'>
+            <div style='font-size:1.05em;color:#1F2937;margin-bottom:5px;'>
+                <b>{item["hora"]}</b> &nbsp;{item["icono"]}&nbsp; <b>{item["evento"]}</b>
             </div>
-            <div style='font-size:.9em;line-height:1.5;color:#4B5563;'>
+            <div style='font-size:.88em;line-height:1.6;color:#374151;'>
                 <b>👩 Mamá:</b> {item["mama"]}<br>
                 <b>👨 Papá:</b> {item["papa"]}
             </div>
         </div>""", unsafe_allow_html=True)
 
 # ─── VISTAS ───────────────────────────────────────────────────
+DIAPER_TYPE_MAP = {
+    "Pipí 💧":          "diaper_wet",
+    "Caca 💩":          "diaper_dirty",
+    "Pipí + Caca 💧💩": "diaper_both",
+    "Seco 🏜️":          "diaper_dry",
+}
+DIAPER_ICONS = {"diaper_wet":"💧","diaper_dirty":"💩","diaper_both":"💧💩","diaper_dry":"🏜️"}
+PHASE_ICONS  = {"feeding":"🍼","sleeping":"😴","activity":"🎯","idle":"☀️"}
+
 def render_setup():
-    st.markdown("<h1 style='text-align:center;color:#4B5563;'>🌙 BebéGuía</h1>",
-                unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>🌙 BebéGuía</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align:center;color:#9CA3AF;'>Tu guía en equipo.</p>",
                 unsafe_allow_html=True)
     with st.form("setup_form"):
@@ -207,7 +280,10 @@ def render_setup():
             "Mixta (pecho + biberón)",
             "Fórmula / Biberón",
         ])
+        tz = st.number_input("Tu zona horaria (UTC+?)", value=1, min_value=-12, max_value=14, step=1,
+                             help="Europa Central = 1 (invierno) o 2 (verano/CEST)")
         if st.form_submit_button("Empezar →", use_container_width=True) and name:
+            st.session_state.utc_offset = int(tz)
             st.session_state.baby = {"name": name, "birth": birth, "feed": feed}
             st.session_state.page = "main"
             change_phase("idle")
@@ -219,126 +295,119 @@ def render_settings():
     feed_opts = ["Lactancia materna exclusiva", "Mixta (pecho + biberón)", "Fórmula / Biberón"]
     with st.form("settings_form"):
         new_name = st.text_input("Nombre", value=baby['name'])
-        idx = feed_opts.index(baby['feed']) if baby['feed'] in feed_opts else 0
+        idx      = feed_opts.index(baby['feed']) if baby['feed'] in feed_opts else 0
         new_feed = st.selectbox("Alimentación", feed_opts, index=idx)
+        new_tz   = st.number_input("Zona horaria (UTC+?)",
+                                   value=st.session_state.get('utc_offset', 1),
+                                   min_value=-12, max_value=14, step=1)
         if st.form_submit_button("Guardar", use_container_width=True):
             st.session_state.baby.update(name=new_name, feed=new_feed)
+            st.session_state.utc_offset = int(new_tz)
             save_data()
             st.success("¡Guardado!")
             st.session_state.page = "main"
             st.rerun()
     if st.button("← Volver"):
         st.session_state.page = "main"; st.rerun()
-    # Zona peligrosa al fondo
     st.markdown("---")
     with st.expander("⚠️ Zona peligrosa"):
         if st.button("🗑️ Borrar todos los datos", type="primary"):
-            if os.path.exists(DB_FILE):
-                os.remove(DB_FILE)
-            for k in list(st.session_state.keys()):
-                del st.session_state[k]
+            if os.path.exists(DB_FILE): os.remove(DB_FILE)
+            for k in list(st.session_state.keys()): del st.session_state[k]
             st.rerun()
 
 def render_main():
-    baby = st.session_state.baby
-    days = age_days()
+    baby   = st.session_state.baby
+    days   = age_days()
     aw_max = get_aw_max(days)
-    now = datetime.datetime.now()
-    el = elapsed_min()
+    now    = now_local()
+    el     = elapsed_min()
 
     # Cabecera
     c1, c2, c3 = st.columns([3, 1, 1])
     with c1:
         st.subheader(f"👶 {baby['name']}")
-        weeks = days // 7
-        st.caption(f"{days} días ({weeks} sem) · {baby['feed']}")
+        st.caption(f"{days}d · {days//7}sem · {baby['feed']} · {now.strftime('%H:%M')} (UTC+{st.session_state.get('utc_offset',1)})")
     with c2:
         if st.button("📋"): st.session_state.page = "history"; st.rerun()
     with c3:
         if st.button("⚙️"): st.session_state.page = "settings"; st.rerun()
 
     st.markdown("---")
-
-    # Estado actual
     phase = st.session_state.phase
+
     if phase == "idle":
-        st.info("☀️ **Despierto y tranquilo** — Si busca, ofrécele pecho o biberón.")
+        st.info("☀️ **Despierto y tranquilo** — Ofrécele pecho/biberón cuando busque.")
 
     elif phase == "feeding":
-        st.success(f"🍼 **Comiendo** — hace {el} min\n\n"
-                   "Si se duerme comiendo antes de los 4 meses: es normal, pásalo a dormir.")
+        st.success(f"🍼 **Comiendo** — {el} min\n\n"
+                   f"{'Si se duerme comiendo: normal antes de los 4 meses. Ponlo a dormir directamente.' if days < 120 else 'Intenta que termine despierto para separar toma y sueño.'}")
 
     elif phase == "sleeping":
         st.markdown(
-            f"<div style='background:#F3E8FF;padding:15px;border-radius:10px;margin-bottom:15px;'>"
-            f"😴 <b>Durmiendo</b> — hace {el} min<br><br>"
-            f"<i>SUEÑO SEGURO:</i> Boca arriba · superficie firme · sin mantas sueltas.</div>",
+            f"<div style='background:#F3E8FF;padding:15px;border-radius:10px;margin-bottom:12px;'>"
+            f"😴 <b>Durmiendo</b> — {el} min<br>"
+            f"<small>Boca arriba · superficie firme · sin mantas sueltas.</small></div>",
             unsafe_allow_html=True)
-        is_day = 7 <= now.hour < 20
         if days < 30 and el >= 210:
-            st.error("🚨 Lleva casi 4h sin comer. Despiértalo suavemente.")
-        elif days >= 30 and is_day and el >= 120:
-            st.warning("⚠️ Siesta larga (2h). Plantéate despertarle para proteger el sueño nocturno.")
+            st.error("🚨 Casi 4h sin comer. Despiértalo suavemente.")
+        elif days >= 30 and 7 <= now.hour < 20 and el >= 120:
+            st.warning("⚠️ Siesta >2h de día. Plantéate despertarle para proteger el sueño nocturno.")
 
     elif phase == "activity":
-        pct = min(int(el / aw_max * 100), 100)
+        pct   = min(int(el / aw_max * 100), 100)
         color = "green" if pct < 60 else ("orange" if pct < 85 else "red")
-        st.info(f"🎯 **Tiempo de juego** — hace {el} min  (ventana: {aw_max} min)")
+        st.info(f"🎯 **Actividad** — {el} min · Ventana máx: {aw_max} min")
         st.markdown(
-            f"<div style='background:#E5E7EB;border-radius:8px;height:10px;'>"
-            f"<div style='background:{color};width:{pct}%;height:10px;border-radius:8px;'></div></div>",
+            f"<div style='background:#E5E7EB;border-radius:8px;height:12px;'>"
+            f"<div style='background:{color};width:{pct}%;height:12px;border-radius:8px;'></div></div>",
             unsafe_allow_html=True)
         if el >= aw_max:
-            st.error(f"🚨 Ventana de sueño cerrada ({el} min). Acuéstalo ya.")
+            st.error(f"🚨 Ventana cerrada ({el} min). Acuéstalo ya.")
         elif el >= int(aw_max * 0.8):
             st.warning(f"⏰ Quedan ~{aw_max - el} min. Empieza a calmarlo.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Botones de acción
+    # Botones
     c1, c2, c3, c4 = st.columns(4)
     if c1.button("🍼 Comer",  use_container_width=True): change_phase("feeding");  st.rerun()
     if c2.button("😴 Dormir", use_container_width=True): change_phase("sleeping"); st.rerun()
     if c3.button("🎯 Jugar",  use_container_width=True): change_phase("activity"); st.rerun()
     if c4.button("🧷 Pañal",  use_container_width=True): st.session_state.page = "diaper"; st.rerun()
 
-    # Métricas rápidas de hoy
+    # Métricas
     st.markdown("---")
-    hoy = datetime.date.today()
+    hoy = now.date()
     logs_hoy = [l for l in st.session_state.logs if l['ts'].date() == hoy]
     tomas = sum(1 for l in logs_hoy if l['type'] == "feeding")
     wet   = sum(1 for l in logs_hoy if l['type'] in ("diaper_wet", "diaper_both"))
     col1, col2, col3 = st.columns(3)
-    col1.metric("Tomas hoy", f"{tomas}", help="Mínimo orientativo: 8/día")
-    col2.metric("Pañales mojados", f"{wet}", help="Mínimo: 6/día → buena hidratación")
-    col3.metric("Tiempo despierto", f"{el} min", help=f"Ventana máx: {aw_max} min")
+    col1.metric("Tomas hoy", tomas, help="Meta orientativa: ≥8/día")
+    col2.metric("Pañales mojados", wet, help="Mínimo: 6/día")
+    col3.metric("Tiempo en fase", f"{el} min")
 
-    # Agenda
+    # Agenda EASY
     st.markdown("---")
-    st.subheader("📅 Planificador Familiar (12h)")
+    st.subheader("📅 Planificador EASY — Próximas 12h")
+    st.caption("Se ajusta al ritmo real del bebé. Morado = turno de papá (Dream Window).")
     agenda = build_agenda(baby, now, phase, el)
     render_agenda(agenda)
 
 def render_history():
     st.subheader("📋 Historial de hoy")
     if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
-
-    hoy = datetime.date.today()
+    hoy = now_local().date()
     logs_hoy = [l for l in st.session_state.logs if l['ts'].date() == hoy]
-
     if not logs_hoy:
         st.info("Sin registros hoy.")
-        return
-
-    for l in reversed(logs_hoy):
-        hora  = l['ts'].strftime("%H:%M")
-        icono = DIAPER_ICONS.get(l['type'], PHASE_ICONS.get(l['type'], "📝"))
-        # FIX BUG 3: sin f-strings anidados con las mismas comillas
-        dur_txt = f" ({l['durMin']} min)" if l.get('durMin') else ""
-        col_txt = f" — color: {l['color']}" if l.get('color') else ""
-        st.markdown(f"- **{hora}** | {icono} `{l['type']}`{dur_txt}{col_txt}")
-
-    # Exportar CSV
+    else:
+        for l in reversed(logs_hoy):
+            hora  = l['ts'].strftime("%H:%M")
+            icono = DIAPER_ICONS.get(l['type'], PHASE_ICONS.get(l['type'], "📝"))
+            dur   = f" ({l['durMin']} min)" if l.get('durMin') else ""
+            col   = f" — {l['color']}" if l.get('color') else ""
+            st.markdown(f"- **{hora}** | {icono} `{l['type']}`{dur}{col}")
     st.markdown("---")
     lines = ["hora,tipo,duracion_min,color"]
     for l in logs_hoy:
@@ -349,36 +418,31 @@ def render_history():
 
 def render_diaper():
     st.subheader("🧷 ¿Qué hay en el pañal?")
-    # FIX BUG 2: usamos el mapa explícito
     tipo_label = st.radio("Contenido:", list(DIAPER_TYPE_MAP.keys()))
-
     color = None
     if "Caca" in tipo_label:
-        color = st.selectbox("Color de la caca", [
+        color = st.selectbox("Color:", [
             "Mostaza 🟡 (Normal)",
             "Verde 💚 (Normal/Transición)",
             "Meconio ⬛ (Normal primeros días)",
             "Blanca/Gris ⬜ (⚠️ Alerta pediátrica)",
             "Roja/Sangre 🔴 (⚠️ Alerta pediátrica)",
         ])
-
     c1, c2 = st.columns(2)
     if c1.button("Guardar", type="primary"):
-        log_type = DIAPER_TYPE_MAP[tipo_label]
-        add_log(log_type, color=color)
+        add_log(DIAPER_TYPE_MAP[tipo_label], color=color)
         if color and ("Blanca" in color or "Roja" in color):
-            st.error("⚠️ Este color requiere valoración pediátrica. Contacta con tu médico.")
+            st.error("⚠️ Este color requiere valoración pediátrica.")
         else:
             st.session_state.page = "main"; st.rerun()
     if c2.button("Cancelar"):
         st.session_state.page = "main"; st.rerun()
 
 # ─── ROUTER ───────────────────────────────────────────────────
-pages = {
+{
     "setup":    render_setup,
     "settings": render_settings,
     "main":     render_main,
     "diaper":   render_diaper,
     "history":  render_history,
-}
-pages.get(st.session_state.page, render_setup)()
+}.get(st.session_state.page, render_setup)()
