@@ -35,17 +35,22 @@ def load_data():
 
 def save_data():
     s = {
-        'baby':       st.session_state.baby,
+        'baby':       copy.deepcopy(st.session_state.baby),
         'logs':       copy.deepcopy(st.session_state.logs),
         'phase':      st.session_state.phase,
         'phaseStart': st.session_state.phaseStart,
         'utc_offset': st.session_state.get('utc_offset', 1),
     }
     if s['baby'] and s['baby'].get('birth'):
-        s['baby']['birth'] = s['baby']['birth'].strftime("%Y-%m-%d")
+        birth = s['baby']['birth']
+        # Puede ser date, datetime o ya un string
+        if hasattr(birth, 'strftime'):
+            s['baby']['birth'] = birth.strftime("%Y-%m-%d")
+        # Si ya es string lo dejamos como está
     for log in s['logs']:
-        log['ts'] = log['ts'].isoformat()
-    if s['phaseStart']:
+        if hasattr(log['ts'], 'isoformat'):
+            log['ts'] = log['ts'].isoformat()
+    if s['phaseStart'] and hasattr(s['phaseStart'], 'isoformat'):
         s['phaseStart'] = s['phaseStart'].isoformat()
     with open(DB_FILE, 'w') as f:
         json.dump(s, f)
@@ -146,8 +151,15 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
     total_tomas    = 0
     mama_sleep_min = 0
     mama_free_min  = 0
-    papa_sleep_min = 0   # cuando mamá cubre → papá puede dormir
-    papa_duty_end  = None  # hora en que termina el turno nocturno de papá
+
+    # Para calcular el bloque continuo de papá:
+    # Guardamos (inicio_turno_papa, fin_turno_papa) de cada tramo nocturno
+    papa_was_on_duty = False
+    papa_shift_start = None
+    papa_shifts      = []   # lista de (start, end) de cada turno de papá
+
+    def is_papas_shift(h):
+        return h >= 21 or h < 3
 
     for _ in range(MAX_ITER):
         if cursor >= limit or len(agenda) >= 30:
@@ -155,28 +167,23 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
 
         h        = cursor.hour
         is_night = h >= 20 or h < 7
-        is_papas = h >= 21 or h < 3   # turno Dream Window papá
 
         # ── ACTIVITY ─────────────────────────────────────────
-        # Va primero para capturarlo correctamente al entrar desde "Jugar"
         if current_phase == "activity":
-            # De noche no hay actividad, saltar directo a dormir
             if is_night:
                 current_phase = "sleeping"
                 sim_elapsed   = 0
                 continue
 
-            act_dur  = max(5, aw_max - 15)
-            wait     = max(1, act_dur - sim_elapsed)
-            cursor  += timedelta(minutes=wait)
-            h        = cursor.hour
-            is_papas = h >= 21 or h < 3
-
+            act_dur = max(5, aw_max - 15)
+            wait    = max(1, act_dur - sim_elapsed)
+            cursor += timedelta(minutes=wait)
+            h       = cursor.hour
+            on_duty = is_papas_shift(h)
             act_desc = ("Piel con piel, canto, móvil contrastes"
                         if is_fase1 else "Tummy time, espejo, suelo")
 
-            # Si al terminar la actividad ya es turno de papá → mamá se va a dormir
-            if is_papas:
+            if on_duty:
                 mama_sleep_min += act_dur
                 mama_ev = "💤 Prepárate para dormir"
                 papa_ev = f"🎯 {act_desc} · Vigila señales de sueño"
@@ -187,11 +194,18 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
                 papa_ev = f"🎯 {act_desc} · Señales: bostezos, mirada perdida"
                 bg, brd = "#FFF7ED", "#F97316"
 
+            # Tracking turno papá
+            if on_duty and not papa_was_on_duty:
+                papa_shift_start = cursor - timedelta(minutes=act_dur)
+                papa_was_on_duty = True
+            elif not on_duty and papa_was_on_duty:
+                papa_shifts.append((papa_shift_start, cursor))
+                papa_was_on_duty = False
+
             agenda.append(dict(
                 hora=cursor.strftime("%H:%M"), icono="🎯",
-                evento=f"Fin actividad → a dormir  ({act_dur} min)",
-                mama=mama_ev, papa=papa_ev,
-                bg=bg, border=brd
+                evento=f"Fin actividad → a dormir ({act_dur} min)",
+                mama=mama_ev, papa=papa_ev, bg=bg, border=brd
             ))
             current_phase = "sleeping"
             sim_elapsed   = 0
@@ -202,10 +216,10 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
             wait     = max(1, feed_dur - sim_elapsed)
             cursor  += timedelta(minutes=wait)
             h        = cursor.hour
-            is_papas = h >= 21 or h < 3
+            on_duty  = is_papas_shift(h)
             total_tomas += 1
 
-            if is_papas:
+            if on_duty:
                 papa_role = papa_feed_method(days, feed_type)
                 mama_role = "💤 DURMIENDO"
                 bg, brd   = "#EFF6FF", "#3B82F6"
@@ -216,13 +230,19 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
                              else "🤝 Acompaña, saca gases")
                 mama_role = "🤱 Da el pecho / biberón"
                 bg, brd   = "#F0FDF4", "#22C55E"
-                papa_sleep_min += feed_dur  # mamá cubre → papá descansa
+                mama_free_min += feed_dur
+
+            if on_duty and not papa_was_on_duty:
+                papa_shift_start = cursor - timedelta(minutes=feed_dur)
+                papa_was_on_duty = True
+            elif not on_duty and papa_was_on_duty:
+                papa_shifts.append((papa_shift_start, cursor))
+                papa_was_on_duty = False
 
             agenda.append(dict(
                 hora=cursor.strftime("%H:%M"), icono="🍼",
                 evento=f"Toma #{total_tomas} terminada",
-                mama=mama_role, papa=papa_role,
-                bg=bg, border=brd
+                mama=mama_role, papa=papa_role, bg=bg, border=brd
             ))
             current_phase = "sleeping" if is_night else "activity"
             sim_elapsed   = 0
@@ -233,9 +253,9 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
             wait      = max(1, sleep_dur - sim_elapsed)
             cursor   += timedelta(minutes=wait)
             h         = cursor.hour
-            is_papas  = h >= 21 or h < 3
+            on_duty   = is_papas_shift(h)
 
-            if is_papas:
+            if on_duty:
                 mama_sleep_min += sleep_dur
                 mama_role = "💤 DURMIENDO — bloque largo"
                 papa_hint = (papa_feed_method(days, feed_type)
@@ -243,39 +263,59 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
                              else "jeringa/dedo/biberón según semanas")
                 papa_role = f"🌙 De guardia. Al despertar: {papa_hint}"
                 bg, brd   = "#EDE9FE", "#8B5CF6"
-                # Registrar fin del turno de papá (primera vez que sale de is_papas)
-                if papa_duty_end is None and not (cursor.hour >= 21 or cursor.hour < 3):
-                    papa_duty_end = cursor
             else:
                 mama_free_min += sleep_dur
-                papa_sleep_min += sleep_dur  # mamá cubre siesta diurna
-                mama_role = "🛁 Ducha · Comida · Descanso  (tú primero)"
+                mama_role = "🛁 Ducha · Comida · Descanso (tú primero)"
                 papa_role = "😴 Descansa / duerme mientras puedas"
                 bg, brd   = "#ECFDF5", "#10B981"
 
+            if on_duty and not papa_was_on_duty:
+                papa_shift_start = cursor - timedelta(minutes=sleep_dur)
+                papa_was_on_duty = True
+            elif not on_duty and papa_was_on_duty:
+                papa_shifts.append((papa_shift_start, cursor))
+                papa_was_on_duty = False
+
             agenda.append(dict(
                 hora=cursor.strftime("%H:%M"), icono="☀️",
-                evento=f"Despierta  (siesta: {sleep_dur} min)",
-                mama=mama_role, papa=papa_role,
-                bg=bg, border=brd
+                evento=f"Despierta (siesta: {sleep_dur} min)",
+                mama=mama_role, papa=papa_role, bg=bg, border=brd
             ))
             current_phase = "feeding"
             sim_elapsed   = 0
 
-    # Bloque continuo de papá: desde fin del turno (~03:00) hasta ~07:00
-    papa_block_h = 0.0
-    if papa_duty_end:
-        wake_time = papa_duty_end.replace(hour=7, minute=0, second=0, microsecond=0)
-        if wake_time < papa_duty_end:
-            wake_time += timedelta(days=1)
-        papa_block_h = round((wake_time - papa_duty_end).total_seconds() / 3600, 1)
+    # Cerrar turno abierto si el horizonte lo corta
+    if papa_was_on_duty and papa_shift_start:
+        papa_shifts.append((papa_shift_start, cursor))
+
+    # Bloque continuo de papá = fin del último turno nocturno → próximo despertar
+    # (él puede dormir desde que termina su guardia hasta que el bebé vuelve a llamar)
+    papa_block_min = 0
+    if papa_shifts:
+        last_end = papa_shifts[-1][1]   # hora en que terminó su último turno
+        # Próximo evento de la agenda después de last_end
+        next_wake = next(
+            (datetime.datetime.strptime(
+                last_end.strftime("%Y-%m-%d") + " " + item["hora"], "%Y-%m-%d %H:%M")
+             for item in agenda
+             if datetime.datetime.strptime(
+                 last_end.strftime("%Y-%m-%d") + " " + item["hora"], "%Y-%m-%d %H:%M"
+             ) > last_end),
+            last_end + timedelta(hours=3)   # fallback: 3h si no hay evento
+        )
+        papa_block_min = int((next_wake - last_end).total_seconds() / 60)
+
+    # Tiempo total de guardia de papá
+    papa_duty_min = sum(
+        int((e - s).total_seconds() / 60) for s, e in papa_shifts
+    )
 
     summary = dict(
-        tomas       = total_tomas,
-        mama_sleep_h= round(mama_sleep_min / 60, 1),
-        mama_free_h = round(mama_free_min / 60, 1),
-        papa_block_h= papa_block_h,
-        papa_sleep_h= round(papa_sleep_min / 60, 1),
+        tomas        = total_tomas,
+        mama_sleep_h = round(mama_sleep_min / 60, 1),
+        mama_free_h  = round(mama_free_min / 60, 1),
+        papa_block_h = round(papa_block_min / 60, 1),
+        papa_duty_h  = round(papa_duty_min / 60, 1),
     )
     return agenda, summary
 
@@ -296,9 +336,9 @@ def render_agenda(agenda, summary):
 
     c4, c5 = st.columns(2)
     c4.metric("🧔 Bloque continuo papá", f"{summary['papa_block_h']}h",
-              help="Desde que termina su turno nocturno (~03:00) hasta las 07:00 → su bloque de sueño seguido")
-    c5.metric("😴 Descanso total papá", f"{summary['papa_sleep_h']}h",
-              help="Suma de todos los ratos en que mamá cubre y papá puede dormir (siestas de día incluidas)")
+              help="Desde que termina su turno nocturno hasta el próximo despertar → su sueño del tirón")
+    c5.metric("🕐 Guardia total papá", f"{summary['papa_duty_h']}h",
+              help="Total de horas en turno nocturno activo (21–03h)")
 
     st.markdown("---")
 
