@@ -261,7 +261,9 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
                 papa_hint = (papa_feed_method(days, feed_type)
                              if "materna" not in feed_type.lower()
                              else "jeringa/dedo/biberón según semanas")
-                papa_role = f"🌙 De guardia. Al despertar: {papa_hint}"
+                alarm_str = cursor.strftime("%H:%M")
+                papa_role = (f"😴 DUERME — pon alarma a las {alarm_str} "
+                             f"| Al despertar: {papa_hint}")
                 bg, brd   = "#EDE9FE", "#8B5CF6"
             else:
                 mama_free_min += sleep_dur
@@ -432,13 +434,15 @@ def render_main():
     el     = elapsed_min()
 
     # Cabecera
-    c1, c2, c3 = st.columns([3, 1, 1])
+    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
     with c1:
         st.subheader(f"👶 {baby['name']}")
         st.caption(f"{days}d · {days//7}sem · {baby['feed']} · {now.strftime('%H:%M')} (UTC+{st.session_state.get('utc_offset',1)})")
     with c2:
-        if st.button("📋"): st.session_state.page = "history"; st.rerun()
+        if st.button("📊"): st.session_state.page = "metrics"; st.rerun()
     with c3:
+        if st.button("📋"): st.session_state.page = "history"; st.rerun()
+    with c4:
         if st.button("⚙️"): st.session_state.page = "settings"; st.rerun()
 
     st.markdown("---")
@@ -506,19 +510,27 @@ def render_history():
     st.subheader("📋 Historial de hoy")
     if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
     hoy = now_local().date()
-    logs_hoy = [l for l in st.session_state.logs if l['ts'].date() == hoy]
-    if not logs_hoy:
+    # Guardamos (índice_global, log) para poder borrar por índice real
+    logs_hoy_idx = [(i, l) for i, l in enumerate(st.session_state.logs)
+                    if l['ts'].date() == hoy]
+    if not logs_hoy_idx:
         st.info("Sin registros hoy.")
     else:
-        for l in reversed(logs_hoy):
+        st.caption("Toca 🗑️ para borrar un registro incorrecto.")
+        for global_i, l in reversed(logs_hoy_idx):
             hora  = l['ts'].strftime("%H:%M")
             icono = DIAPER_ICONS.get(l['type'], PHASE_ICONS.get(l['type'], "📝"))
             dur   = f" ({l['durMin']} min)" if l.get('durMin') else ""
             col   = f" — {l['color']}" if l.get('color') else ""
-            st.markdown(f"- **{hora}** | {icono} `{l['type']}`{dur}{col}")
+            c_txt, c_btn = st.columns([5, 1])
+            c_txt.markdown(f"**{hora}** | {icono} `{l['type']}`{dur}{col}")
+            if c_btn.button("🗑️", key=f"del_{global_i}"):
+                st.session_state.logs.pop(global_i)
+                save_data()
+                st.rerun()
     st.markdown("---")
     lines = ["hora,tipo,duracion_min,color"]
-    for l in logs_hoy:
+    for _, l in logs_hoy_idx:
         lines.append(f"{l['ts'].strftime('%H:%M')},{l['type']},"
                      f"{l.get('durMin','')},{l.get('color','')}")
     st.download_button("⬇️ Exportar CSV", "\n".join(lines),
@@ -546,6 +558,109 @@ def render_diaper():
     if c2.button("Cancelar"):
         st.session_state.page = "main"; st.rerun()
 
+# ─── MÉTRICAS ─────────────────────────────────────────────────
+def render_metrics():
+    st.subheader("📊 Métricas del día")
+    if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
+
+    now = now_local()
+    hoy = now.date()
+    logs_hoy = [l for l in st.session_state.logs if l['ts'].date() == hoy]
+    days = age_days()
+
+    if not logs_hoy and st.session_state.phase == "idle":
+        st.info("Sin datos de hoy todavía. Empieza a registrar con los botones.")
+        return
+
+    sleep_logs = [l for l in logs_hoy if l['type'] == 'sleeping']
+    feed_logs  = [l for l in logs_hoy if l['type'] == 'feeding']
+    wet_logs   = [l for l in logs_hoy if l['type'] in ('diaper_wet', 'diaper_both')]
+    dirty_logs = [l for l in logs_hoy if l['type'] in ('diaper_dirty', 'diaper_both')]
+
+    # Sueño total (incluye fase actual si está durmiendo)
+    total_sleep_min = sum(l.get('durMin', 0) for l in sleep_logs)
+    current_el = elapsed_min()
+    if st.session_state.phase == 'sleeping':
+        total_sleep_min += current_el
+    longest_sleep = max((l.get('durMin', 0) for l in sleep_logs), default=0)
+    if st.session_state.phase == 'sleeping':
+        longest_sleep = max(longest_sleep, current_el)
+
+    # Minutos de día transcurridos desde medianoche
+    mins_since_midnight = int((now - datetime.datetime.combine(hoy, datetime.time.min)).total_seconds() / 60)
+    pct_sleep = round(total_sleep_min / mins_since_midnight * 100) if mins_since_midnight > 0 else 0
+    # Referencia: RN duerme 16-18h/día → 67-75%
+    sleep_ok = pct_sleep >= 55
+
+    # Alimentación
+    total_feed_min = sum(l.get('durMin', 0) for l in feed_logs)
+    avg_feed = round(total_feed_min / len(feed_logs)) if feed_logs else 0
+    feed_times = sorted([l['ts'] for l in feed_logs])
+    if len(feed_times) >= 2:
+        intervals = [(feed_times[i+1]-feed_times[i]).total_seconds()/60
+                     for i in range(len(feed_times)-1)]
+        avg_interval = round(sum(intervals)/len(intervals))
+    else:
+        avg_interval = None
+    last_feed = max((l['ts'] for l in feed_logs), default=None)
+    min_since_feed = int((now - last_feed).total_seconds()/60) if last_feed else None
+
+    st.markdown("---")
+    st.markdown("#### 😴 Sueño")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total dormido hoy",
+              f"{total_sleep_min//60}h {total_sleep_min%60}m",
+              help="RN: 16–18h/día es normal")
+    c2.metric("Tramo más largo", f"{longest_sleep} min",
+              help="Con el tiempo este número irá creciendo")
+    ok_txt = "✅ Bien" if sleep_ok else "⚠️ Poco"
+    c3.metric("% día dormido", f"{pct_sleep}%", delta=ok_txt,
+              help="Referencia RN: ≥65% del día")
+
+    st.markdown("#### 🍼 Alimentación")
+    c4, c5, c6 = st.columns(3)
+    c4.metric("Tomas completadas", len(feed_logs),
+              delta="✅ Bien" if len(feed_logs) >= 8 else "⚠️ Meta: 8",
+              help="Meta orientativa: ≥8 tomas/día en primeras semanas")
+    c5.metric("Duración media", f"{avg_feed} min" if avg_feed else "–",
+              help="Normal: 10–25 min por toma")
+    c6.metric("Intervalo medio entre tomas",
+              f"{avg_interval} min" if avg_interval else "–",
+              help="Recomendado <180 min en primeras 3 semanas")
+
+    if min_since_feed is not None:
+        alerta = days < 21 and min_since_feed > 180
+        msg = (f"🔴 **Última toma hace {min_since_feed} min** — ¡Hay que alimentar!"
+               if alerta else
+               f"🟢 Última toma hace **{min_since_feed} min**")
+        st.info(msg)
+
+    st.markdown("#### 🧷 Pañales")
+    c7, c8, c9 = st.columns(3)
+    wet_ok = len(wet_logs) >= 6
+    c7.metric("Mojados 💧", len(wet_logs),
+              delta="✅ Bien" if wet_ok else "⚠️ Meta: 6",
+              help="≥6 pañales mojados/día = buena hidratación")
+    c8.metric("Con caca 💩", len(dirty_logs),
+              help="Variable según edad y método de alimentación")
+    total_diapers = len([l for l in logs_hoy if l['type'].startswith('diaper')])
+    c9.metric("Total pañales", total_diapers)
+
+    st.markdown("#### 📈 Línea de tiempo de hoy")
+    if logs_hoy:
+        icons_map = {"feeding":"🍼","sleeping":"😴","activity":"🎯",
+                     "idle":"☀️","diaper_wet":"💧","diaper_dirty":"💩",
+                     "diaper_both":"💧💩","diaper_dry":"🏜️"}
+        events = sorted(logs_hoy, key=lambda x: x['ts'])
+        timeline = "  →  ".join(
+            f"{l['ts'].strftime('%H:%M')} {icons_map.get(l['type'],'📝')}"
+            for l in events
+        )
+        st.markdown(f"<div style='font-size:0.85em;color:#374151;line-height:2;'>{timeline}</div>",
+                    unsafe_allow_html=True)
+    else:
+        st.caption("Sin eventos registrados aún.")
+
 # ─── ROUTER ───────────────────────────────────────────────────
 {
     "setup":    render_setup,
@@ -553,4 +668,5 @@ def render_diaper():
     "main":     render_main,
     "diaper":   render_diaper,
     "history":  render_history,
+    "metrics":  render_metrics,
 }.get(st.session_state.page, render_setup)()
