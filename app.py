@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import datetime
 from datetime import timedelta
 import json
@@ -133,33 +134,6 @@ def get_feed_range(days):
 def get_aw_max(days):
     return get_aw_range(days)[1]
 
-def phase_status(phase, elapsed, days):
-    if phase == "activity":
-        lo, hi = get_aw_range(days)
-        if elapsed < lo:
-            return 'ok', '#22C55E', f"✅ Normal — aún dentro del rango ({lo}–{hi} min despierto)"
-        if elapsed <= hi:
-            return 'warning', '#F59E0B', f"⚠️ Acercándose al límite — {hi - elapsed} min restantes (rango: {lo}–{hi} min)"
-        return 'alert', '#EF4444', f"🚨 Ventana cerrada — lleva {elapsed} min (máx. {hi} min)"
-    elif phase == "feeding":
-        lo, hi = get_feed_range(days)
-        if elapsed < lo:
-            return 'ok', '#22C55E', f"✅ Toma en curso — normal hasta ~{hi} min"
-        if elapsed <= hi:
-            return 'ok', '#22C55E', f"✅ Duración normal ({lo}–{hi} min)"
-        return 'warning', '#F59E0B', f"⚠️ Toma larga ({elapsed} min) — si está relajado y suelto, ya está satisfecho"
-    elif phase == "sleeping":
-        h = now_local().hour
-        is_night = h >= 20 or h < 7
-        lo, hi, _ = get_sleep_range(days, is_night)
-        tipo = "nocturno" if is_night else "siesta"
-        if elapsed < lo:
-            return 'ok', '#8B5CF6', f"😴 Sueño {tipo} normal — mínimo esperado: {lo} min"
-        if elapsed <= hi:
-            return 'ok', '#8B5CF6', f"😴 Dentro del rango ({lo}–{hi} min) — despertará pronto"
-        return 'warning', '#F59E0B', f"⚠️ Sueño largo ({elapsed} min) — máx. esperado {hi} min. Puede estar bien."
-    return 'ok', '#6B7280', ""
-
 def elapsed_min():
     if not st.session_state.phaseStart:
         return 0
@@ -220,13 +194,11 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
     mode = st.session_state.get('papa_mode', '💼 Trabajando')
 
     def is_papas_shift(h):
-        # 1. Turno de noche (Dream Window)
         if dw_s > dw_e:
             if h >= dw_s or h < dw_e: return True
         else:
             if dw_s <= h < dw_e: return True
         
-        # 2. Turnos de día según modo
         if '🏠 Teletrabajo' in mode and 12 <= h < 14: return True
         if '🌴 Vacaciones' in mode and 8 <= h < 14: return True
         return False
@@ -238,7 +210,6 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
         h        = cursor.hour
         is_night = h >= 20 or h < 7
 
-        # ── ACTIVITY ─────────────────────────────────────────
         if current_phase == "activity":
             if is_night:
                 current_phase = "sleeping"
@@ -269,7 +240,6 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
             current_phase = "sleeping"
             sim_elapsed   = 0
 
-        # ── EAT ──────────────────────────────────────────────
         elif current_phase == "feeding":
             feed_dur = 25 if "materna" in feed_type.lower() else 20
             wait     = max(1, feed_dur - sim_elapsed)
@@ -295,7 +265,6 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
             current_phase = "sleeping" if is_night else "activity"
             sim_elapsed   = 0
 
-        # ── SLEEP / IDLE ──────────────────────────────────────
         elif current_phase in ("sleeping", "idle"):
             sleep_dur, sleep_lbl = get_sleep_durations(days, is_night)
             wait          = max(1, sleep_dur - sim_elapsed)
@@ -313,7 +282,7 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
                 bg, brd   = "#EDE9FE", "#8B5CF6"
             else:
                 if not is_night:
-                    mama_free_min += sleep_dur # Mamá libre mientras el bebé duerme de día
+                    mama_free_min += sleep_dur
                 mama_role = "🛁 Ducha · Comida · Descanso"
                 papa_role = "💼 Trabajando" if 'Trabajando' in mode else "Otras tareas"
                 bg, brd   = "#ECFDF5", "#10B981"
@@ -326,18 +295,14 @@ def build_agenda(baby, now, current_phase, sim_elapsed):
             current_phase = "feeding"
             sim_elapsed   = 0
 
-    # --- CÁLCULO DE MÉTRICAS MATEMÁTICAS EXACTAS ---
-    # Horas exactas del Dream Window configurado
     dw_hours = (24 - dw_s + dw_e) if dw_s > dw_e else (dw_e - dw_s)
     
-    # Horas extra de papá según su modo
     papa_day_h = 0
     if '🏠 Teletrabajo' in mode: papa_day_h = 2.0
     elif '🌴 Vacaciones' in mode: papa_day_h = 6.0
     
     papa_total_duty_h = dw_hours + papa_day_h
     
-    # Horas seguidas que duerme papá después de su turno
     wh = st.session_state.get('work_hour', 7)
     papa_block_h = (24 - dw_e + wh) if dw_e > wh else (wh - dw_e)
     if papa_block_h < 0 or papa_block_h > 12: papa_block_h = 0
@@ -358,18 +323,13 @@ def render_agenda(agenda, summary):
 
     st.markdown("#### 📊 Resumen proyectado (24h)")
     c1, c2, c3 = st.columns(3)
-    c1.metric("🍼 Tomas mínimas", summary["tomas"],
-              help="Tomas proyectadas en las próximas 24h según el ritmo actual")
-    c2.metric("💤 Dream Window mamá", f"{summary['mama_sleep_h']}h",
-              help="Horas nocturnas calculadas según tu configuración")
-    c3.metric("🌿 Tiempo libre mamá", f"{summary['mama_free_h']}h",
-              help="Siestas de día en que mamá puede ducharse, comer o descansar sola")
+    c1.metric("🍼 Tomas mínimas", summary["tomas"])
+    c2.metric("💤 Dream Window mamá", f"{summary['mama_sleep_h']}h")
+    c3.metric("🌿 Tiempo libre mamá", f"{summary['mama_free_h']}h")
 
     c4, c5 = st.columns(2)
-    c4.metric("🧔 Papá duerme del tirón", f"{summary['papa_block_h']}h",
-              help="Desde que termina su turno hasta la hora de trabajar")
-    c5.metric("🕐 Guardia total papá", f"{summary['papa_duty_h']}h",
-              help="Horas activo (Turno de noche + turnos de día según modalidad)")
+    c4.metric("🧔 Papá duerme del tirón", f"{summary['papa_block_h']}h")
+    c5.metric("🕐 Guardia total papá", f"{summary['papa_duty_h']}h")
 
     st.markdown("---")
 
@@ -422,14 +382,11 @@ def render_setup():
         tz = st.number_input("Tu zona horaria (UTC+?)", value=1, min_value=-12, max_value=14, step=1,
                              help="Europa Central = 1 (invierno) o 2 (verano/CEST)")
         col_dw1, col_dw2 = st.columns(2)
-        dw_start = col_dw1.number_input("Dream Window papá — empieza (hora)", value=21, min_value=18, max_value=23, step=1,
-                                         help="Hora en que papá asume el turno nocturno")
-        dw_end   = col_dw2.number_input("Dream Window papá — termina (hora)", value=3, min_value=1, max_value=8, step=1,
-                                         help="Hora en que termina el turno de papá")
-        work_hour = st.number_input("Papá entra a trabajar a las (hora)", value=7, min_value=4, max_value=12, step=1,
-                                    help="Define cuándo papá debe levantarse.")
-        papa_mode = st.selectbox("Modo papá hoy", ["💼 Trabajando", "🏠 Teletrabajo", "🌴 Vacaciones"],
-                                 help="Ajusta el reparto de tareas en el planificador")
+        dw_start = col_dw1.number_input("Dream Window papá — empieza (hora)", value=21, min_value=18, max_value=23, step=1)
+        dw_end   = col_dw2.number_input("Dream Window papá — termina (hora)", value=3, min_value=1, max_value=8, step=1)
+        work_hour = st.number_input("Papá entra a trabajar a las (hora)", value=7, min_value=4, max_value=12, step=1)
+        papa_mode = st.selectbox("Modo papá hoy", ["💼 Trabajando", "🏠 Teletrabajo", "🌴 Vacaciones"])
+        
         if st.form_submit_button("Empezar →", use_container_width=True) and name:
             st.session_state.utc_offset = int(tz)
             st.session_state.dw_start   = int(dw_start)
@@ -510,7 +467,7 @@ def render_main():
         else:
             age_str = "Día 0 · ¡Bienvenido al mundo!"
         st.subheader(f"👶 {baby['name']}")
-        st.caption(f"{age_str} · {baby['feed']} · {now.strftime('%H:%M')} (UTC+{st.session_state.get('utc_offset',1)})")
+        st.caption(f"{age_str} · {baby['feed']}")
     with c2:
         if st.button("📖"): st.session_state.page = "guide";   st.rerun()
     with c3:
@@ -523,17 +480,54 @@ def render_main():
     st.markdown("---")
     phase = st.session_state.phase
 
+    # --- CRONÓMETRO EN VIVO ---
+    if phase != "idle" and st.session_state.phaseStart:
+        # Calculamos los segundos exactos que han pasado desde el inicio de la fase
+        diff_sec = int((now - st.session_state.phaseStart).total_seconds())
+        
+        # Asignamos colores e iconos según el estado
+        if phase == "sleeping":
+            t_color = "#8B5CF6"  # Morado
+            t_icon, t_label = "😴", "Durmiendo"
+        elif phase == "feeding":
+            t_color = "#22C55E"  # Verde
+            t_icon, t_label = "🍼", "Comiendo"
+        else:
+            t_color = "#F97316"  # Naranja
+            t_icon, t_label = "🎯", "Actividad"
+
+        html_timer = f"""
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 10px; background: #f9fafb; border-radius: 12px; border: 1px solid #e5e7eb; margin-bottom: 15px;">
+            <div style="font-size: 1.1rem; color: #4B5563; font-weight: bold; font-family: system-ui, sans-serif;">{t_icon} {t_label}</div>
+            <div id="live-timer" style="font-size: 4rem; font-weight: 900; color: {t_color}; font-variant-numeric: tabular-nums; line-height: 1.1; font-family: system-ui, sans-serif;">
+                00:00
+            </div>
+        </div>
+        <script>
+            var diff = {diff_sec};
+            var timerEl = document.getElementById("live-timer");
+            function updateTime() {{
+                var h = Math.floor(diff / 3600);
+                var m = Math.floor((diff % 3600) / 60);
+                var s = diff % 60;
+                var timeStr = (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s);
+                if (h > 0) timeStr = h + ":" + timeStr;
+                timerEl.innerHTML = timeStr;
+                diff++;
+            }}
+            updateTime();
+            setInterval(updateTime, 1000);
+        </script>
+        """
+        components.html(html_timer, height=135)
+    
+    # --- MENSAJES DINÁMICOS DE ESTADO ---
     if phase == "idle":
         st.info("☀️ **Despierto y tranquilo** — Ofrécele pecho/biberón cuando busque.")
     elif phase == "feeding":
-        st.success(f"🍼 **Comiendo** — {el} min\n\n"
-                   f"{'Si se duerme comiendo: normal antes de los 4 meses. Ponlo a dormir directamente.' if days < 120 else 'Intenta que termine despierto para separar toma y sueño.'}")
+        st.success(f"{'Si se duerme comiendo: normal antes de los 4 meses. Ponlo a dormir directamente.' if days < 120 else 'Intenta que termine despierto para separar toma y sueño.'}")
     elif phase == "sleeping":
-        st.markdown(
-            f"<div style='background:#F3E8FF;padding:15px;border-radius:10px;margin-bottom:12px;'>"
-            f"😴 <b>Durmiendo</b> — {el} min<br>"
-            f"<small>Boca arriba · superficie firme · sin mantas sueltas.</small></div>",
-            unsafe_allow_html=True)
+        st.markdown("<div style='text-align: center; color: #6B7280; font-size: 0.9em; margin-bottom: 15px;'>Boca arriba · superficie firme · sin mantas sueltas.</div>", unsafe_allow_html=True)
         if days < 30 and el >= 210:
             st.error("🚨 Casi 4h sin comer. Despiértalo suavemente.")
         elif days >= 30 and 7 <= now.hour < 20 and el >= 120:
@@ -541,13 +535,13 @@ def render_main():
     elif phase == "activity":
         pct   = min(int(el / aw_max * 100), 100)
         color = "green" if pct < 60 else ("orange" if pct < 85 else "red")
-        st.info(f"🎯 **Actividad** — {el} min · Ventana máx: {aw_max} min")
+        st.info(f"Ventana máxima recomendada: **{aw_max} min**")
         st.markdown(
             f"<div style='background:#E5E7EB;border-radius:8px;height:12px;'>"
             f"<div style='background:{color};width:{pct}%;height:12px;border-radius:8px;'></div></div>",
             unsafe_allow_html=True)
         if el >= aw_max:
-            st.error(f"🚨 Ventana cerrada ({el} min). Acuéstalo ya.")
+            st.error(f"🚨 Ventana cerrada. Acuéstalo ya.")
         elif el >= int(aw_max * 0.8):
             st.warning(f"⏰ Quedan ~{aw_max - el} min. Empieza a calmarlo.")
 
