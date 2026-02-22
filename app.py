@@ -94,6 +94,7 @@ if 'initialized' not in st.session_state:
         st.session_state.timer_paused    = False
         st.session_state.paused_seconds  = 0
         st.session_state.pause_start     = None
+        st.session_state.last_completed  = None
         st.session_state.page            = "setup"
     st.session_state.initialized = True
 
@@ -147,6 +148,51 @@ def get_feed_range(days):
 def get_aw_max(days):
     return get_aw_range(days)[1]
 
+# ─── EVALUACIÓN DE DURACIÓN REAL ──────────────────────────────
+def assess_log(log_type, dur_min, ts, days):
+    """
+    Retorna (emoji_estado, color_fondo, color_borde, texto_valoracion, rango_label)
+    comparando la duración real contra el rango esperado para la edad.
+    """
+    if log_type == "feeding":
+        lo, hi = get_feed_range(days)
+        rango = f"{lo}–{hi} min"
+        if dur_min < lo:
+            return "⚡", "#FEF3C7", "#F59E0B", f"Toma corta ({dur_min} min) — puede que no haya vaciado bien. Observa si pide antes de lo esperado.", rango
+        elif dur_min > hi:
+            return "🐢", "#EDE9FE", "#8B5CF6", f"Toma larga ({dur_min} min) — puede que esté usando el pecho/biberón de chupete o tenga dificultad de agarre.", rango
+        else:
+            return "✅", "#F0FDF4", "#22C55E", f"Duración perfecta ({dur_min} min). Dentro del rango esperado.", rango
+
+    elif log_type == "sleeping":
+        h = ts.hour
+        is_night = h >= 20 or h < 7
+        lo, hi, lbl = get_sleep_range(days, is_night)
+        tipo = "nocturno" if is_night else "diurno"
+        rango = lbl
+        if dur_min < lo:
+            return "😓", "#FEF3C7", "#F59E0B", f"Sueño {tipo} corto ({dur_min} min, esperado {lbl}). ¿Ruido? ¿Hambre? ¿Demasiado calor/frío?", rango
+        elif dur_min > hi:
+            label_largo = "✅ Estupendo" if is_night else "⚠️ Siesta muy larga — puede afectar el sueño nocturno"
+            color_f = "#F0FDF4" if is_night else "#FEF3C7"
+            color_b = "#22C55E" if is_night else "#F59E0B"
+            return ("🌙" if is_night else "⚠️"), color_f, color_b, f"{label_largo} ({dur_min} min, rango {lbl}).", rango
+        else:
+            return "✅", "#F0FDF4", "#22C55E", f"Sueño {tipo} dentro del rango ({dur_min} min, esperado {lbl}).", rango
+
+    elif log_type == "activity":
+        lo, hi = get_aw_range(days)
+        rango = f"{lo}–{hi} min"
+        if dur_min < lo:
+            return "🌱", "#EFF6FF", "#3B82F6", f"Actividad corta ({dur_min} min) — normal si estaba somnoliento. La ventana mínima es {lo} min.", rango
+        elif dur_min > hi:
+            return "🚨", "#FEF2F2", "#EF4444", f"Actividad demasiado larga ({dur_min} min, máx {hi} min) — probablemente estuvo sobreestimulado. Signos: llanto, mirada perdida, puños cerrados.", rango
+        else:
+            return "✅", "#F0FDF4", "#22C55E", f"Actividad dentro de la ventana ({dur_min} min, rango {rango}).", rango
+
+    # pañales y otros — sin valoración de duración
+    return None, None, None, None, None
+
 def elapsed_sec():
     """Segundos transcurridos en la fase actual, descontando tiempo pausado."""
     if not st.session_state.phaseStart:
@@ -170,7 +216,18 @@ def add_log(log_type, dur_min=0, color=None, ts=None):
 def change_phase(new_phase):
     dur = elapsed_min()
     if st.session_state.phaseStart and st.session_state.phase != "idle" and dur > 1:
-        add_log(st.session_state.phase, dur)
+        prev_phase = st.session_state.phase
+        prev_start = st.session_state.phaseStart
+        add_log(prev_phase, dur)
+        # Guardar resumen para mostrar banner de confirmación
+        emoji, bg, border, msg, rango = assess_log(prev_phase, dur, prev_start, age_days())
+        st.session_state.last_completed = {
+            "type": prev_phase, "dur": dur, "emoji": emoji,
+            "bg": bg, "border": border, "msg": msg, "rango": rango,
+            "hora": prev_start.strftime("%H:%M"),
+        }
+    else:
+        st.session_state.last_completed = None
     st.session_state.phase          = new_phase
     st.session_state.phaseStart     = now_local()
     st.session_state.timer_paused   = False
@@ -523,6 +580,22 @@ def render_main():
     st.markdown("---")
     phase = st.session_state.phase
 
+    # ── BANNER: último evento completado y su valoración ──────────
+    lc = st.session_state.get('last_completed')
+    if lc and lc.get('msg'):
+        icon_map = {"feeding": "🍼", "sleeping": "😴", "activity": "🎯"}
+        tipo_txt = {"feeding": "Toma", "sleeping": "Sueño", "activity": "Actividad"}
+        st.markdown(
+            f"<div style='background:{lc['bg']};border-left:5px solid {lc['border']};"
+            f"padding:12px 14px;border-radius:8px;margin-bottom:12px;'>"
+            f"<div style='font-size:0.8em;color:#6B7280;margin-bottom:2px;'>"
+            f"✔ Registrado · {icon_map.get(lc['type'],'')} {tipo_txt.get(lc['type'],lc['type'])} "
+            f"· desde las {lc['hora']} · <b>{lc['dur']} min</b> · rango esperado: {lc['rango']}</div>"
+            f"<div style='font-size:0.93em;color:#1F2937;'>{lc['emoji']} {lc['msg']}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
     # --- CRONÓMETRO EN VIVO CON PAUSA ---
     if phase != "idle" and st.session_state.phaseStart:
         diff_sec  = elapsed_sec()
@@ -591,29 +664,62 @@ def render_main():
             save_data()
             st.rerun()
     
-    # --- MENSAJES DINÁMICOS DE ESTADO ---
+    # --- MENSAJES DINÁMICOS DE ESTADO CON RANGOS ─────────────────
     if phase == "idle":
         st.info("☀️ **Despierto y tranquilo** — Ofrécele pecho/biberón cuando busque.")
+
     elif phase == "feeding":
-        st.success(f"{'Si se duerme comiendo: normal antes de los 4 meses. Ponlo a dormir directamente.' if days < 120 else 'Intenta que termine despierto para separar toma y sueño.'}")
+        lo, hi = get_feed_range(days)
+        if el < lo:
+            pct = int(el / lo * 100)
+            st.info(f"🍼 Toma en curso · {el} min — Rango esperado: **{lo}–{hi} min** "
+                    f"· Quedan al menos **{lo - el} min** para completar el mínimo.")
+        elif el <= hi:
+            st.success(f"🍼 Toma en curso · {el} min ✅ — Dentro del rango ({lo}–{hi} min). "
+                       f"{'Si se duerme comiendo: normal antes de los 4 meses, ponlo a dormir directamente.' if days < 120 else 'Intenta que termine despierto.'}")
+        else:
+            st.warning(f"🍼 Toma larga · {el} min ⚠️ — El rango esperado es {lo}–{hi} min. "
+                       f"¿Está usando el pecho de chupete? Puedes valorar terminar la toma.")
+
     elif phase == "sleeping":
-        st.markdown("<div style='text-align: center; color: #6B7280; font-size: 0.9em; margin-bottom: 15px;'>Boca arriba · superficie firme · sin mantas sueltas.</div>", unsafe_allow_html=True)
+        h = now.hour
+        is_night = h >= 20 or h < 7
+        lo_s, hi_s, lbl_s = get_sleep_range(days, is_night)
+        tipo_s = "nocturno" if is_night else "diurno"
+        st.markdown("<div style='text-align:center;color:#6B7280;font-size:0.9em;margin-bottom:10px;'>Boca arriba · superficie firme · sin mantas sueltas.</div>", unsafe_allow_html=True)
+        if el < lo_s:
+            st.info(f"😴 Sueño {tipo_s} · {el} min — Rango esperado: **{lbl_s}** · Aún dentro del ciclo normal.")
+        elif el <= hi_s:
+            st.success(f"😴 Sueño {tipo_s} · {el} min ✅ — Dentro del rango esperado ({lbl_s}).")
+        else:
+            if is_night:
+                st.success(f"🌙 Sueño nocturno largo · {el} min 🎉 — ¡Muy bien! Rango base era {lbl_s}.")
+            else:
+                st.warning(f"⚠️ Siesta muy larga · {el} min — Rango diurno: {lbl_s}. "
+                           f"Considera despertarlo para proteger el sueño nocturno.")
         if days < 30 and el >= 210:
             st.error("🚨 Casi 4h sin comer. Despiértalo suavemente.")
-        elif days >= 30 and 7 <= now.hour < 20 and el >= 120:
-            st.warning("⚠️ Siesta >2h de día. Plantéate despertarle para proteger el sueño nocturno.")
+
     elif phase == "activity":
-        pct   = min(int(el / aw_max * 100), 100)
-        color = "green" if pct < 60 else ("orange" if pct < 85 else "red")
-        st.info(f"Ventana máxima recomendada: **{aw_max} min**")
+        lo_a, hi_a = get_aw_range(days)
+        pct   = min(int(el / hi_a * 100), 100)
+        color = "#22C55E" if pct < 60 else ("#F97316" if pct < 85 else "#EF4444")
         st.markdown(
-            f"<div style='background:#E5E7EB;border-radius:8px;height:12px;'>"
-            f"<div style='background:{color};width:{pct}%;height:12px;border-radius:8px;'></div></div>",
+            f"<div style='background:#E5E7EB;border-radius:8px;height:14px;margin-bottom:8px;'>"
+            f"<div style='background:{color};width:{pct}%;height:14px;border-radius:8px;"
+            f"transition:width 0.3s;'></div></div>",
             unsafe_allow_html=True)
-        if el >= aw_max:
-            st.error(f"🚨 Ventana cerrada. Acuéstalo ya.")
-        elif el >= int(aw_max * 0.8):
-            st.warning(f"⏰ Quedan ~{aw_max - el} min. Empieza a calmarlo.")
+        if el < lo_a:
+            st.info(f"🎯 Actividad · {el} min — Ventana: **{lo_a}–{hi_a} min** · Aún en la primera mitad, bien.")
+        elif el <= hi_a:
+            quedan = hi_a - el
+            msg = f"🎯 Actividad · {el} min ✅ — Rango: {lo_a}–{hi_a} min · Quedan ~{quedan} min de ventana."
+            if pct >= 80:
+                st.warning(f"⏰ {msg} Empieza a calmarlo pronto.")
+            else:
+                st.info(msg)
+        else:
+            st.error(f"🚨 Ventana cerrada · {el} min (máx {hi_a} min). Señales de cansancio: bostezo, mirada perdida, puños cerrados. Acuéstalo ya.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -644,19 +750,49 @@ def render_history():
     st.subheader("📋 Historial de hoy")
     if st.button("← Volver"): st.session_state.page = "main"; st.rerun()
     hoy = now_local().date()
+    days = age_days()
     logs_hoy_idx = [(i, l) for i, l in enumerate(st.session_state.logs)
                     if l['ts'].date() == hoy]
     if not logs_hoy_idx:
         st.info("Sin registros hoy.")
     else:
         st.caption("Toca 🗑️ para borrar un registro incorrecto.")
+        type_label = {"feeding": "Toma", "sleeping": "Sueño", "activity": "Actividad",
+                      "diaper_wet": "Pañal mojado", "diaper_dirty": "Pañal caca",
+                      "diaper_both": "Pañal completo", "diaper_dry": "Pañal seco"}
         for global_i, l in reversed(logs_hoy_idx):
             hora  = l['ts'].strftime("%H:%M")
             icono = DIAPER_ICONS.get(l['type'], PHASE_ICONS.get(l['type'], "📝"))
-            dur   = f" ({l['durMin']} min)" if l.get('durMin') else ""
-            col   = f" — {l['color']}" if l.get('color') else ""
-            c_txt, c_btn = st.columns([5, 1])
-            c_txt.markdown(f"**{hora}** | {icono} `{l['type']}`{dur}{col}")
+            dur   = l.get('durMin', 0)
+            col_s = l.get('color', '')
+            label = type_label.get(l['type'], l['type'])
+
+            # Valoración de duración
+            emoji_v, bg_v, border_v, msg_v, rango_v = assess_log(l['type'], dur, l['ts'], days)
+
+            # Construir tarjeta
+            if msg_v:
+                bg_card = bg_v; border_card = border_v
+                dur_txt = f"{dur} min &nbsp;·&nbsp; <span style='font-size:0.8em;color:#6B7280;'>esperado: {rango_v}</span>"
+                assess_html = f"<div style='font-size:0.82em;color:#374151;margin-top:3px;'>{emoji_v} {msg_v}</div>"
+            else:
+                bg_card = "#F9FAFB"; border_card = "#D1D5DB"
+                dur_txt = ""
+                assess_html = f"<div style='font-size:0.82em;color:#6B7280;'>{col_s}</div>" if col_s else ""
+
+            c_txt, c_btn = st.columns([6, 1])
+            with c_txt:
+                st.markdown(
+                    f"<div style='background:{bg_card};border-left:4px solid {border_card};"
+                    f"padding:8px 12px;border-radius:6px;margin-bottom:6px;'>"
+                    f"<div style='font-size:0.95em;color:#111827;'>"
+                    f"<b>{hora}</b> &nbsp; {icono} <b>{label}</b>"
+                    + (f" &nbsp;·&nbsp; {dur_txt}" if dur else "") +
+                    f"</div>"
+                    f"{assess_html}"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
             if c_btn.button("🗑️", key=f"del_{global_i}"):
                 st.session_state.logs.pop(global_i)
                 save_data()
